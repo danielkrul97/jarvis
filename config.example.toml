@@ -1,0 +1,32 @@
+# Jarvis — vzorová konfigurace.
+# Zkopíruj do ~/.config/jarvis/config.toml a uprav; chybějící hodnoty = defaults níže.
+# API klíč patří VÝHRADNĚ do ~/.config/jarvis/secrets.env (SENDGRID_API_KEY=...), ne sem.
+
+[capture]
+meta_interval_s = 10        # vzorek metadat aktivního okna
+shot_interval_s = 60        # pokus o screenshot
+idle_threshold_s = 120      # nad tuto neaktivitu se nesnímá
+max_dimension = 1568        # delší strana snímku po zmenšení (limit Anthropic vision)
+phash_min_distance = 7      # minimální Hamming vzdálenost dHash, aby se snímek uložil
+blacklist_class = ["(?i)keepass", "(?i)bitwarden", "(?i)1password"]
+blacklist_title = ["(?i)anonymní", "(?i)incognito", "(?i)private browsing", "(?i)soukromé prohlížení", "(?i)bank"]
+
+[analysis]
+max_images_per_run = 8
+model = "claude-haiku-4-5-20251001"
+daily_budget_usd = 1.0      # denní strop; po překročení analýza běží lokálně (titulky-only)
+send_images = true          # false = žádný snímek neopustí stroj, analýza jen z titulků
+timeout_s = 600
+
+[digest]
+hour = 19                   # lokální čas (systemd timer i `jarvis run` používají lokální čas)
+model = ""                  # prázdné = výchozí model claude CLI
+
+[email]
+to = "dankrul.krul@gmail.com"
+from = "dankrul.krul@gmail.com"   # musí být verifikovaný odesílatel v SendGrid (Single Sender Verification)
+from_name = "Jarvis"
+subject_prefix = "Jarvis digest"
+
+[retention]
+screenshots_days = 7        # starší snímky se mažou (metadata a souhrny zůstávají)

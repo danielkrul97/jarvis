@@ -1,0 +1,25 @@
+[package]
+name = "jarvis"
+version = "0.1.0"
+edition = "2021"
+description = "Osobní Jarvis: snímá X11 obrazovku, extrahuje aktivitu přes Claude Code CLI a posílá denní digest e-mailem"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+libc = "0.2.186"
+pulldown-cmark = "0.12"
+regex = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = { version = "2", features = ["json"] }
+x11rb = { version = "0.13", features = ["screensaver"] }
+
+[profile.release]
+lto = "thin"
