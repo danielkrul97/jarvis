@@ -28,5 +28,136 @@ from = "dankrul.krul@gmail.com"   # musí být verifikovaný odesílatel v SendG
 from_name = "Jarvis"
 subject_prefix = "Jarvis digest"
 
+[listen]
+enabled = true              # poslech mikrofonu (near-realtime přepis řeči do DB)
+pause_when_locked = true    # neposlouchat, když je aktivní zámek/šetřič obrazovky
+                            # (XFCE screensaver přes D-Bus); netýká se `jarvis meet`
+engine = "auto"             # auto = ElevenLabs Scribe (cloud), při chybě lokální whisper;
+                            # "elevenlabs" = jen Scribe; "whisper" = jen lokálně (zdarma,
+                            # nic neopouští stroj, ale náročné na CPU/GPU). V "auto" se
+                            # whisper načte až při prvním fallbacku (líně).
+scribe_model = "scribe_v1"  # ElevenLabs Scribe model (scribe_v1 | scribe_v2); ~0,22 $/h
+scribe_keyterms = ["Jarvis", "Jarvisi"]  # biasing Scribe na vlastní jména (jinak slyší
+                            # "Jarvisi" jako "Já vysí" a oslovení nezabere); [] = neposílat
+device = ""                 # PulseAudio source (`pactl list sources short`); prázdné = výchozí
+model = "large-v3-turbo-q5_0"  # whisper ggml model (fallback; CUDA build, ~0.6 GB VRAM);
+                            # bez GPU přepni na "small-q5_1" (turbo na CPU nestíhá)
+model_path = ""             # explicitní cesta k .bin (přebíjí `model`)
+language = "cs"             # pinnutý jazyk; "auto" = detekce per promluva (2–3× pomalejší)
+hint = "Slovník: Jarvis, Jarvisi, ElevenLabs, digest."  # slovník pro whisper — vlastní
+                            # jména, která jinak komolí; prázdné = bez nápovědy; držet
+                            # slovníkový styl (halucinovaný hint nesmí znít jako oslovení)
+threads = 0                 # vlákna whisperu; 0 = auto (polovina jader, max 8)
+min_speech_ms = 300         # kratší zvuky se zahazují (kliknutí, ťukání)
+silence_ms = 700            # tolik ticha ukončí promluvu
+max_utterance_s = 28        # delší řeč se rozdělí (whisper okno je 30 s)
+vad_speech_mult = 2.0       # práh řeči = šumové dno × tohle; menší = citlivější
+                            # (2.0 pro tichý mikrofon; 3.0 v hlučném prostředí)
+
+[speak]
+enabled = true              # hlasový výstup (ElevenLabs; klíč ELEVENLABS_API_KEY v secrets.env)
+engine = "auto"             # auto = ElevenLabs, při chybě lokální piper; "piper" = jen
+                            # lokálně (zdarma, nic neopouští stroj); "elevenlabs" = bez zálohy
+piper_bin = "piper"         # lokální TTS binárka (pip3 install --user piper-tts)
+piper_voice = "cs_CZ-jirka-medium"  # český hlas; stáhne `jarvis say --download-model`
+voice_id = "JBFqnCBsd6RMkjVDRZzb"  # „George" — teplý britský vypravěč (premade, funguje
+                            # i se scoped klíčem); brumbálovštější hlas: vyber ve Voice
+                            # Library na webu, přidej do účtu a vlož ID sem
+model_id = "eleven_multilingual_v2"  # nejlepší čeština; rychlejší/levnější: eleven_flash_v2_5
+language = "cs"             # vynucení jazyka umí jen *_v2_5 modely; multilingual_v2
+                            # češtinu pozná z textu sám
+output_format = "mp3_44100_128"
+stability = 0.5             # 0–1; nižší = expresivnější přednes
+similarity_boost = 0.75     # 0–1; věrnost hlasu
+style = 0.0                 # 0–1; u češtiny nechat 0 (vyšší deformuje výslovnost)
+speaker_boost = true
+speed = 0.95                # 0.7–1.2; Brumbál nespěchá
+player = ""                 # prázdné = auto (ffplay → mpv → ffmpeg+paplay)
+sink = ""                   # PulseAudio sink pro řeč; sink echo-cancel modulu (např.
+                            # "jarvis_out") dá AEC referenci → Jarvis neslyší sám sebe
+announce_digest = true      # po odeslání digestu ho Jarvis ohlásí nahlas
+cache = true                # stejná fráze se generuje jen jednou (šetří kredity)
+max_chars = 2500            # pojistka: 1 znak = 1 kredit
+
+[converse]
+enabled = true              # hlasový dialog: „Jarvisi, …" → Claude → odpověď nahlas
+wake_words = ["jarvisi", "jarvise"]  # kmeny oslovení (vokativ záměrně — řeč O jarvisovi
+                            # dialog nespouští; volnější spouštění: přidej "jarvis")
+wake_fuzzy = true           # tolerance 1 chyby přepisu („Javi si" ≈ „Jarvisi"); false = přesně
+open_ear = "off"            # odpovídat bez wake-wordu: "off" (jen na jméno) | "followup" (krátké
+                            # okno po odpovědi) | "always" (klasifikátor posoudí každou větu; experiment)
+followup_window_s = 12      # jak dlouho po Jarvisově odpovědi drží follow-up okno (s)
+open_ear_min_words = 2      # promluvu bez jména kratší než tolik slov ignorovat („ehm", „jo")
+model = "claude-haiku-4-5-20251001"  # rychlý model; sdílí strop analysis.daily_budget_usd
+ack = ["Ano, pane?", "Poslouchám, pane.", "K službám, pane.", "Copak, pane?", "Přejete si, pane?", "Jsem tu, pane."]
+                            # okamžitá reakce na oslovení; vybírá se z listu náhodně.
+                            # Necháš-li řádek být, použije se výchozí (delší,
+                            # ~18 frází) zabudovaný list; smí být i jediný řetězec; "" / [] = bez acku
+max_context_exchanges = 3   # kolik minulých výměn se přikládá pro návaznost
+max_turns = 12              # kola agenta při akcích s okny ([wm] enabled); bez nich je vždy 1
+timeout_s = 90
+respect_budget = true       # false = strop konverzace neblokuje (útrata se dál jen eviduje)
+warm = true                 # rezidentní claude proces: odpověď bez CLI startu (~2 s úspora),
+                            # session = konverzační paměť; při chybě fallback na cold spawn
+warm_max_exchanges = 10     # recyklace session (akumuluje kontext → rostly by input tokeny)
+warm_idle_s = 900           # recyklace po 15 min ticha
+web = true                  # agent smí WebSearch/WebFetch — aktuální počasí/zprávy/kurzy
+                            # (web search ~0,01 $/dotaz); false = jen z natrénovaných znalostí
+
+[wm]
+enabled = true              # hlasový Jarvis smí ovládat okna/klávesnici/myš — converse
+                            # agent dostane Bash omezený na `jarvis wm …` a max_turns kol;
+                            # CLI `jarvis wm` funguje vždy, tohle řídí jen hlasovou cestu
+key_delay_ms = 12           # rozestup syntetických kláves (XTest) v ms
+spawn_allowed = ["signal-desktop", "firefox"]
+                            # programy, které smí `jarvis wm spawn` spouštět mimo terminál
+                            # (hlasový agent, timery); přesná shoda — holé jméno = binárka
+                            # v PATH, absolutní cesta = konkrétní soubor. Prázdné = hlasový
+                            # spawn vypnutý. POZOR: shoduje se jen program, ne argumenty —
+                            # dávej sem jen „listové" aplikace. Program, který umí spustit
+                            # další příkaz (xterm -e, flatpak run, gtk-launch, env, ssh…),
+                            # allowlist fakticky obchází. Neomezený spawn z terminálu navíc
+                            # vyžaduje `export JARVIS_WM_UNRESTRICTED=1`
+
+[meet]
+enabled = true              # `jarvis meet <URL>` — Jarvis jako samostatný účastník Google Meet
+                            # (vlastní Chrome + virtuální mikrofon/reproduktor)
+chrome_bin = "google-chrome" # binárka prohlížeče (jméno v PATH nebo absolutní cesta)
+display_name = "Jarvis"     # jméno bota v hovoru (vyplní se do „Vaše jméno")
+mic_sink = "jarvis_mic_sink"   # null-sink pro Jarvisovu řeč → mikrofon hovoru
+mic_source = "jarvis_mic"      # remap-source (mic_sink.monitor) — Chrome ho vybere jako mikrofon
+ear_sink = "jarvis_ear_sink"   # null-sink pro zvuk hovoru → STT poslouchá jeho .monitor
+profile_dir = ""            # profil dedikovaného Chrome; prázdné = <data_dir>/meet-profile.
+                            # POZOR: pro schůzky blokující anonymní hosty se do tohoto profilu
+                            # jednou přihlas Google účtem (jako u meeting-botů), pak už join projde
+join_model = ""             # model vizuálního join-agenta; prázdné = default CLI
+join_timeout_s = 180        # kolik smí trvat připojení vč. čekání na admit
+join_max_turns = 20         # strop kol join-agenta (screenshot → akce → ověření)
+transcribe = true           # průběžně přepisovat hovor do DB (utterances, source=meet)
+summary = true              # po hovoru vygenerovat a odeslat shrnutí schůzky
+summary_to = "email"        # kam: email | telegram | both | none
+
+[sms]
+enabled = false             # SMS přes Twilio (TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN
+                            # v secrets.env); po zapnutí smí hlasový agent `jarvis sms`
+from = ""                   # Messaging Service SID (MG…), E.164 číslo, nebo alfanumerický
+                            # sender (max 11 znaků; na SMS pak nejde odpovědět)
+to = ""                     # výchozí příjemce v E.164 (+420…) — typicky vlastní mobil
+max_chars = 480             # pojistka délky (účtuje se po segmentech; s diakritikou ~70 znaků/segment)
+
+[runbooks]
+enabled = true              # fáze D: spouštění SCHVÁLENÝCH automatizací (runbooků).
+                            # Návrh z `jarvis propose` schválíš `jarvis runbook approve <id>`
+                            # (chce terminál) nebo z Telegramu; bez schválení neběží nic
+voice_run = true            # hlasový agent smí `jarvis runbook run` (jen schválené;
+                            # schvalovat hlasem nejde nikdy — mikrofonu se nevěří)
+timeout_s = 600             # tvrdý strop běhu skriptu (pak SIGKILL celé process group)
+max_output_chars = 4000     # ořez výstupu běhu ukládaného do DB
+notify_sms = false          # nový návrh ohlásit SMS (vyžaduje zapnuté [sms]; stojí peníze)
+telegram_approve = false    # schvalování na dálku: vlastní Telegram bot (@BotFather),
+                            # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID v secrets.env;
+                            # bot poslouchá JEN tento chat — „schval N" / „zamítni N";
+                            # nové návrhy tam ohlašuje sám. Poll à 5 min (runbooks timer)
+
 [retention]
 screenshots_days = 7        # starší snímky se mažou (metadata a souhrny zůstávají)

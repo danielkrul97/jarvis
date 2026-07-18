@@ -1,0 +1,23 @@
+# Build whisper.cpp (whisper-rs-sys) potřebuje cmake, libclang a CUDA toolkit.
+# Všechno je na tomto stroji nainstalované user-space bez sudo:
+#   pip3 install --user cmake libclang
+#   micromamba create -p ~/.local/opt/cuda-env -c nvidia -c conda-forge \
+#     cuda-nvcc=12.6 cuda-cudart-dev=12.6 libcublas-dev=12.6 cuda-cccl=12.6
+# Viz README (Build) a PLAN §3.7.
+[env]
+CMAKE = "/home/dkrul/.local/bin/cmake"
+LIBCLANG_PATH = "/home/dkrul/.local/lib/python3.10/site-packages/clang/native"
+CUDACXX = "/home/dkrul/.local/opt/cuda-env/bin/nvcc"
+CUDAToolkit_ROOT = "/home/dkrul/.local/opt/cuda-env"
+CUDAHOSTCXX = "/usr/bin/g++"
+# GTX 1650 = Turing, compute capability 7.5 (jediná cílová architektura → rychlejší build)
+CUDAARCHS = "75"
+
+[build]
+# -L: whisper-rs-sys hledá CUDA knihovny jen v /usr/local/cuda a /opt/cuda;
+# rpath: binárka najde libcudart/libcublas za běhu bez LD_LIBRARY_PATH
+# (systemd units tak nepotřebují žádné Environment=).
+rustflags = [
+  "-L", "/home/dkrul/.local/opt/cuda-env/lib",
+  "-C", "link-args=-Wl,-rpath,/home/dkrul/.local/opt/cuda-env/lib",
+]

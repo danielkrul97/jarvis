@@ -33,6 +33,21 @@ pub fn unit_files(
             ),
         ),
         (
+            "jarvis-listen.service",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — poslech mikrofonu (near-realtime STT)\n\
+                 After=graphical-session.target pulseaudio.service pipewire-pulse.service\n\n\
+                 [Service]\n\
+                 ExecStart={exec} listen\n\
+                 Restart=always\n\
+                 RestartSec=5\n\
+                 EnvironmentFile=-%h/.config/jarvis/secrets.env\n\n\
+                 [Install]\n\
+                 WantedBy=default.target\n"
+            ),
+        ),
+        (
             "jarvis-analyze.service",
             format!(
                 "[Unit]\n\
@@ -78,6 +93,31 @@ pub fn unit_files(
                  WantedBy=timers.target\n"
             ),
         ),
+        (
+            "jarvis-runbooks.service",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — schválené automatizace (run-due)\n\n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 ExecStart={exec} runbook run-due\n\
+                 Environment=DISPLAY={display}\n\
+                 {xauth_line}\
+                 EnvironmentFile=-%h/.config/jarvis/secrets.env\n"
+            ),
+        ),
+        (
+            "jarvis-runbooks.timer",
+            "[Unit]\n\
+             Description=Jarvis — schválené automatizace (timer à 5 min)\n\n\
+             [Timer]\n\
+             OnCalendar=*:0/5\n\
+             Persistent=true\n\
+             RandomizedDelaySec=15\n\n\
+             [Install]\n\
+             WantedBy=timers.target\n"
+                .to_string(),
+        ),
     ]
 }
 
@@ -112,13 +152,28 @@ pub fn install(cfg: &Config, print_only: bool) -> Result<()> {
         println!("✓ zapsán {name}");
     }
     systemctl(&["daemon-reload"])?;
-    systemctl(&[
+    let mut enable = vec![
         "enable",
         "--now",
         "jarvis-capture.service",
         "jarvis-analyze.timer",
         "jarvis-digest.timer",
-    ])?;
+    ];
+    if cfg.listen.enabled {
+        enable.push("jarvis-listen.service");
+    }
+    if cfg.runbooks.enabled {
+        enable.push("jarvis-runbooks.timer");
+    }
+    systemctl(&enable)?;
+    if !cfg.listen.enabled {
+        // poslech vypnutý v configu → případnou dřívější službu zastavit;
+        // best effort (unit nemusí existovat)
+        let _ = systemctl(&["disable", "--now", "jarvis-listen.service"]);
+    }
+    if !cfg.runbooks.enabled {
+        let _ = systemctl(&["disable", "--now", "jarvis-runbooks.timer"]);
+    }
     println!("Units aktivní. Kontrola: systemctl --user list-timers 'jarvis-*'");
     Ok(())
 }
@@ -146,21 +201,33 @@ mod tests {
     #[test]
     fn units_contain_essentials() {
         let units = unit_files("/usr/bin/jarvis", ":0.0", Some("/home/u/.Xauthority"), 19);
-        assert_eq!(units.len(), 5);
+        assert_eq!(units.len(), 8);
         let capture = &units[0].1;
         assert!(capture.contains("ExecStart=/usr/bin/jarvis capture"));
         assert!(capture.contains("Environment=DISPLAY=:0.0"));
         assert!(capture.contains("XAUTHORITY=/home/u/.Xauthority"));
         assert!(capture.contains("Restart=always"));
-        let digest_timer = &units[4].1;
+        let listen = &units[1].1;
+        assert!(listen.contains("ExecStart=/usr/bin/jarvis listen"));
+        assert!(listen.contains("Restart=always"));
+        let digest_timer = &units[5].1;
         assert!(digest_timer.contains("OnCalendar=*-*-* 19:00:00"));
         assert!(digest_timer.contains("Persistent=true"));
+        // runbooky: skripty můžou hýbat okny → služba potřebuje X prostředí
+        let runbooks = &units[6].1;
+        assert!(runbooks.contains("ExecStart=/usr/bin/jarvis runbook run-due"));
+        assert!(runbooks.contains("Environment=DISPLAY=:0.0"));
+        assert!(runbooks.contains("XAUTHORITY=/home/u/.Xauthority"));
+        let runbooks_timer = &units[7].1;
+        assert!(runbooks_timer.contains("OnCalendar=*:0/5"));
+        assert!(runbooks_timer.contains("Persistent=true"));
     }
 
     #[test]
     fn units_without_xauthority() {
         let units = unit_files("/x", ":0", None, 7);
         assert!(!units[0].1.contains("XAUTHORITY"));
-        assert!(units[4].1.contains("07:00:00"));
+        assert!(!units[6].1.contains("XAUTHORITY"));
+        assert!(units[5].1.contains("07:00:00"));
     }
 }

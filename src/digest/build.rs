@@ -17,6 +17,8 @@ pub struct DayData {
     pub summaries: Vec<HourlyJson>,
     pub degraded_count: usize,
     pub patterns: Vec<Pattern>,
+    pub runbook_runs: Vec<crate::runbook::RunRow>,
+    pub pending_proposals: usize,
     pub cost_usd: f64,
 }
 
@@ -55,6 +57,8 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
         .filter_map(|r| serde_json::from_str(&r.json).ok())
         .collect();
     let pats = patterns::top(conn, 2, 8)?;
+    let runbook_runs = crate::runbook::runs_between(conn, from, to)?;
+    let pending_proposals = crate::runbook::pending_proposals(conn)?.len();
     let cost_usd = db::cost_between(conn, from, to)?;
     Ok(DayData {
         date,
@@ -62,6 +66,8 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
         summaries,
         degraded_count,
         patterns: pats,
+        runbook_runs,
+        pending_proposals,
         cost_usd,
     })
 }
@@ -177,6 +183,31 @@ pub fn deterministic_markdown(data: &DayData) -> String {
         md.push_str("\nNávrh automatizace vygeneruje `jarvis propose`.\n");
     }
 
+    if !data.runbook_runs.is_empty() || data.pending_proposals > 0 {
+        md.push_str("\n## Automatizace (runbooky)\n");
+        for r in &data.runbook_runs {
+            let state = match (r.finished_at, r.exit_code) {
+                (Some(_), Some(0)) => "✓".to_string(),
+                (Some(_), Some(c)) => format!("✗ exit {c}"),
+                (Some(_), None) => "✗ timeout".to_string(),
+                (None, _) => "⚠ nedoběhl".to_string(),
+            };
+            md.push_str(&format!(
+                "- {} **{}** ({}) {}\n",
+                util::fmt_hm(r.started_at),
+                r.name,
+                r.trigger,
+                state
+            ));
+        }
+        if data.pending_proposals > 0 {
+            md.push_str(&format!(
+                "\n{} návrh(y) čekají na schválení — `jarvis runbook pending`.\n",
+                data.pending_proposals
+            ));
+        }
+    }
+
     if data.degraded_count > 0 {
         md.push_str(&format!(
             "\n> {} hodinových souhrnů běželo bez Claude (rozpočet/chyba) — jen z titulků oken.\n",
@@ -199,6 +230,19 @@ fn build_prompt(data: &DayData) -> Result<String> {
         .iter()
         .map(|p| format!("- {} (viděno {}×, id {})", p.description, p.occurrences, p.id))
         .collect();
+    let runbook_txt: Vec<String> = data
+        .runbook_runs
+        .iter()
+        .map(|r| {
+            let state = match (r.finished_at, r.exit_code) {
+                (Some(_), Some(0)) => "OK".to_string(),
+                (Some(_), Some(c)) => format!("selhal (exit {c})"),
+                (Some(_), None) => "zabit timeoutem".to_string(),
+                (None, _) => "nedoběhl".to_string(),
+            };
+            format!("- {} „{}“ ({}): {state}", util::fmt_hm(r.started_at), r.name, r.trigger)
+        })
+        .collect();
 
     Ok(format!(
         "Jsi Jarvis, můj osobní pracovní asistent (mluvíš česky, věcně, přátelsky, \
@@ -208,6 +252,8 @@ fn build_prompt(data: &DayData) -> Result<String> {
          Čas podle aplikací: {by_class}\n\n\
          Hodinové souhrny (JSON z průběžné analýzy):\n{summaries_json}\n\n\
          Opakované vzory vhodné k automatizaci:\n{patterns}\n\n\
+         Běhy schválených automatizací (runbooků) — {pending} návrhů čeká na \
+         schválení:\n{runbooks}\n\n\
          ÚKOL\n\
          Vrať POUZE Markdown (žádné ``` ploty, žádný text okolo), začni řádkem \
          `# Jarvis digest — {date}`. Sekce (vynech prázdné):\n\
@@ -219,12 +265,17 @@ fn build_prompt(data: &DayData) -> Result<String> {
          ## Doporučení na zítřek — max 3 konkrétní, akční doporučení\n\
          ## Automatizační příležitosti — z opakovaných vzorů; u každého přidej \
          `(jarvis propose --pattern ID)`\n\
+         ## Automatizace (runbooky) — co běželo samo a jak dopadlo; selhání \
+         zmiň výrazně; když čekají návrhy na schválení, připomeň \
+         `jarvis runbook pending`\n\
          Buď konkrétní (názvy souborů, projektů, čísla). Žádné vymýšlení — jen co je v podkladech.",
         date = data.date.format("%Y-%m-%d"),
         timeline = timeline,
         by_class = by_class.join(", "),
         summaries_json = summaries_json,
         patterns = if patterns_txt.is_empty() { "(žádné)".to_string() } else { patterns_txt.join("\n") },
+        pending = data.pending_proposals,
+        runbooks = if runbook_txt.is_empty() { "(žádné)".to_string() } else { runbook_txt.join("\n") },
     ))
 }
 
@@ -282,11 +333,36 @@ mod tests {
             }],
             degraded_count: 1,
             patterns: vec![],
+            runbook_runs: vec![
+                crate::runbook::RunRow {
+                    runbook_id: 1,
+                    name: "ranní sync".into(),
+                    started_at: 3600,
+                    finished_at: Some(3660),
+                    exit_code: Some(0),
+                    trigger: "timer".into(),
+                    output: String::new(),
+                },
+                crate::runbook::RunRow {
+                    runbook_id: 2,
+                    name: "zlobivý".into(),
+                    started_at: 7200,
+                    finished_at: Some(7300),
+                    exit_code: None,
+                    trigger: "voice".into(),
+                    output: String::new(),
+                },
+            ],
+            pending_proposals: 2,
             cost_usd: 0.05,
         };
         let md = deterministic_markdown(&data);
         assert!(md.contains("# Jarvis digest — 2026-07-17"));
         assert!(md.contains("## Rozložení času"));
+        assert!(md.contains("## Automatizace (runbooky)"));
+        assert!(md.contains("ranní sync"));
+        assert!(md.contains("✗ timeout"));
+        assert!(md.contains("2 návrh(y) čekají na schválení"));
         assert!(md.contains("| vim | 1 h 0 min |"));
         assert!(md.contains("psaní kódu"));
         assert!(md.contains("rozdělaný PLAN.md"));
@@ -301,10 +377,13 @@ mod tests {
             summaries: vec![],
             degraded_count: 0,
             patterns: vec![],
+            runbook_runs: vec![],
+            pending_proposals: 0,
             cost_usd: 0.0,
         };
         let md = deterministic_markdown(&data);
         assert!(md.contains("# Jarvis digest"));
+        assert!(!md.contains("## Automatizace (runbooky)"));
     }
 
     #[test]

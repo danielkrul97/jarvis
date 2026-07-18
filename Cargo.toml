@@ -19,7 +19,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ureq = { version = "2", features = ["json"] }
-x11rb = { version = "0.13", features = ["screensaver"] }
+whisper-rs = { version = "0.16.0", features = ["tracing_backend", "cuda"] }
+x11rb = { version = "0.13", features = ["screensaver", "xtest"] }
 
 [profile.release]
 lto = "thin"

@@ -19,7 +19,7 @@ rutiny a postupně je předávat automatizacím (fáze A–D, viz §9).
 | Rust | cargo/rustc 1.94.0 |
 | Claude Code CLI | 2.1.212 (`claude` v PATH) |
 | Session | X11, `DISPLAY=:0.0`, 1 monitor 1920×1080 (HDMI-0) |
-| Tajemství | SendGrid API key uložen v `~/.config/jarvis/secrets.env` (0600), **nikdy v repu ani v tomto souboru** |
+| Tajemství | SendGrid + ElevenLabs API klíče v `~/.config/jarvis/secrets.env` (0600), **nikdy v repu ani v tomto souboru** |
 
 Předpoklad: pouze X11 (Wayland mimo rozsah, viz rizika).
 
@@ -131,6 +131,326 @@ náklady i objem dat.
 **Prerekvizita (ruční, jednorázová)**: v SendGrid dashboardu ověřit odesílatele
 (Single Sender Verification — může být přímo gmail adresa), jinak API vrací 403.
 
+### 3.7 Poslech mikrofonu (`jarvis listen`) — hlasový kanál, krok 1
+
+Cíl: Jarvis near-realtime „slyší", co se u počítače děje (schůzky, diktování,
+poznámky nahlas) — další sběrný kanál vedle X11. Krok 1 = spolehlivý přepis do
+DB; napojení na hodinovou analýzu a digest je další krok (čtecí API
+`utterances_between` už existuje).
+
+**Pipeline** (vše lokálně, sync + vlákna, bez tokio):
+
+```
+parec (PulseAudio, s16le 16 kHz mono; fallback arecord)   [vlákno čtečky, restart+backoff]
+  → rámce 30 ms → energetický VAD s adaptivním šumovým prahem
+    (pre-roll 300 ms, konec po silence_ms, split po max_utterance_s)  [hlavní smyčka]
+  → whisper.cpp přes whisper-rs (CPU; audio_ctx trim ≈ 4–6× rychlejší
+    na krátkých promluvách; anti-halucinační filtry no_speech×logprob
+    + blacklist frází)                                     [STT vlákno, fronta 8]
+  → utterances(ts_start, ts_end, text, lang, conf, source)
+```
+
+Rozhodnutí a proč:
+- **parec subprocess, ne in-process capture** — audio server resampluje na
+  16 kHz kvalitněji než my, formát je garantovaný, subprocess pattern je
+  v projektu zavedený (`claude -p`). Pád zdroje řeší respawn s backoffem.
+- **Vlastní energy-VAD** — plně unit-testovatelný, bez dalšího modelu. Známá
+  mez: trvalý hluk (větrák/hudba) propadne do STT a zabije ho až whisper
+  no-speech filtr. Upgrade path: Silero VAD (whisper.cpp ho umí,
+  `whisper-rs` exponuje `whisper_vad.rs` + ~2MB model).
+- **Model default `large-v3-turbo-q5_0` + `language="cs"`, inference na GPU**
+  (GTX 1650, CUDA build). Empiricky 2026-07-17:
+  - CPU (i5-12400F, 6 vláken): turbo RTF 0.85–4 ✗; small-q5_1 RTF 0.22–0.77 ✓
+    → na CPU je obhajitelný jen small.
+  - GPU: turbo RTF **0.17–0.57** ✓ (~6× proti CPU), přepis ~1 s po dořečení;
+    VRAM ~0.6 GB z 4 GB. → default turbo (nejlepší čeština).
+  - Autodetekce jazyka stojí celý encode navíc i na GPU (krátké promluvy
+    RTF 1.1–1.9 ✗) → pin "cs". Bez GPU: `model="small-q5_1"` jedním řádkem.
+  - Česká e2e verifikace: piper TTS věta → pipeline → všechna klíčová slova ✓
+    (turbo si na syntetickém hlasu vymyslel krátký ocas — artefakt TTS +
+    flush bez trimu ticha ve `--wav` režimu; živé promluvy končí trimem).
+  - CUDA toolkit je user-space (micromamba, bez sudo), build wiring
+    v `.cargo/config.toml` (CUDACXX/CUDAToolkit_ROOT/CUDAARCHS=75 + rpath —
+    binárka najde libcudart/libcublas bez LD_LIBRARY_PATH). Pád GPU za běhu
+    → whisper.cpp sám spadne na CPU backend (pomalejší, ale funkční).
+  - **2026-07-17 večer: mikrofon vyměněn za USB HyperX SoloCast** — front
+    jack umřel (-84 dBFS); `module-echo-cancel` přepnut na
+    `source_master=alsa_input.usb-HP__Inc_HyperX_SoloCast-00.analog-stereo`
+    (v `~/.config/pulse/default.pa` i za běhu), `jarvis_denoised` název
+    zůstal → config beze změny. Pozn.: AGC po výměně chvíli „warm-upuje"
+    (první ~sekundy nuly). Přidán `listen.hint` (whisper initial prompt)
+    na vlastní jména.
+  - **Ladění na reálném mikrofonu (front jack, SNR jen ~14 dB)**: VAD práh
+    snížen na floor×2 (`vad_speech_mult`, config) — násobek 3 sekal věty;
+    Front Mic Boost na 30 dB; a hlavně **webrtc noise suppression + AGC**
+    přes `module-echo-cancel` (persistentně v `~/.config/pulse/default.pa`,
+    POZOR: `source_master` explicitně, jinak se naváže na monitor = nuly;
+    `listen.device = "jarvis_denoised"`). Anti-halucinační filtr rozšířen
+    z živých dat: fráze „titulky vytvořil…" padají do conf 0.92 (reálně
+    chodily s 0.87) a samostatné „konec" do conf 0.85 (6× za den na ruchu).
+- **Soukromí**: audio nikdy na disk, jen text; `pause` zahazuje zvuk z RAM
+  a resetuje VAD; `[listen] enabled=false` kanál úplně vypne. Hlídač
+  digitálního ticha (2 min peak<3) hlásí mrtvý mikrofon do logu i `status`.
+- **Observabilita**: heartbeat `listen_alive_ts` (status hlásí „neběží"),
+  per-promluva log s jazykem, confidence a RTF; `doctor --live` měří reálnou
+  úroveň mikrofonu; `listen --wav` = deterministický e2e test celé pipeline.
+
+### 3.8 Hlas Jarvise (`jarvis say`) — hlasový kanál, krok 2 (TTS)
+
+Cíl: Jarvis česky mluví — druhá půlka hlasového kanálu vedle poslechu (§3.7).
+ElevenLabs API, hlas laděný k Brumbálovi, čeština default.
+
+**Pipeline** (sync, bez nových závislostí — `ureq` + subprocess jako jinde):
+
+```
+text → engine (speak.engine):
+  "auto"       ElevenLabs → při JAKÉKOLI chybě (kvóta/síť/klíč) lokální piper
+  "elevenlabs" jen API (bez zálohy)     "piper" jen lokálně (zdarma, offline)
+  → cache lookup (FNV-1a klíč: text+hlas+nastavení; oddělené prostory enginů)
+  → [miss] POST /v1/text-to-speech/{voice_id} (mp3)  |  piper subprocess (wav)
+  → ~/.local/share/jarvis/tts-cache/<klíč>.{mp3,wav} (atomicky přes .part)
+  → přehrávač: ffplay → mpv → ffmpeg+paplay (subprocess, config speak.player)
+```
+
+Rozhodnutí a proč (2026-07-17):
+- **`eleven_multilingual_v2`** — nejlepší kvalita češtiny; `language_code`
+  neumí (vynucení jen u *_v2_5 modelů — klient to řeší sám), češtinu pozná
+  z textu. Levnější/rychlejší alternativa jedním řádkem: `eleven_flash_v2_5`.
+- **Hlas: „George" (premade `JBFqnCBsd6RMkjVDRZzb`)** — teplý hlubší britský
+  vypravěč, z premade hlasů Brumbálovi nejblíž; `speed 0.95` (nespěchá),
+  `style 0.0` (vyšší hodnoty deformují českou výslovnost). POZOR: dodaný
+  API klíč je **scoped jen na `text_to_speech`** (bez `voices_read`/
+  `voices_write`/`user_read`) → Voice Library nejde prohledat ani přidávat
+  přes API; brumbálovštější hlas z knihovny se vybírá na webu (přidat do
+  My Voices → ID do `speak.voice_id`). Premade hlasy fungují i se scoped
+  klíčem.
+- **Cache s deterministickým klíčem (FNV-1a 64)** — 1 znak = 1 kredit;
+  opakovaná hláška (digest announce) se generuje jednou. `DefaultHasher`
+  nejde použít (nestabilní napříč běhy). Spotřeba se loguje do `costs`
+  (component `tts`, tokens_in = znaky).
+- **Pojistky**: `max_chars 2500` strop na request; `enabled=false` kanál
+  vypne; chyby ohlášky v `run` smyčce jen warn (hlas nesmí položit démona);
+  jen `mp3_*` formáty (validace) — přehrávání i cache s kontejnerem počítají.
+- **Integrace**: `jarvis say` CLI (+ `--out`, `--voice`, `--no-cache`,
+  `--list-voices`); po odeslání digestu v `run` smyčce hlasová ohláška
+  (`announce_digest`, default zap.); `doctor` kontroluje klíč + přehrávač,
+  `doctor --live` stav kreditů (scoped klíč bez `user_read` → „zůstatek
+  nevidím", platnost klíče se pozná z typu 401).
+- **Lokální záloha: piper** (`piper-tts` 1.4.2 pip user-space, hlas
+  `cs_CZ-jirka-medium` ~60 MB v models_dir, `say --download-model`; sdílený
+  atomický downloader `util::download` s whisperem). Proč piper: neuronová
+  kvalita na CPU (~1,5 s na větu, RTF « 1), jediný slušný český hlas mezi
+  lokálními TTS, subprocess pattern. Speed se mapuje na `--length-scale`
+  (= 1/speed); text na jeden řádek (piper bere řádek = promluva); stderr
+  se ukazuje jen při chybě (onnxruntime spamuje GPU warningy). `--voice`
+  vynucuje ElevenLabs bez fallbacku (explicitní A/B záměr), `--local`
+  vynucuje piper. Známý trade-off: v "auto" režimu se při ležícím API
+  platí ~1–3 s na neúspěšný pokus ElevenLabs při každé necachované frázi
+  (žádný circuit breaker — stav se nedrží, oživne hned s kredity).
+- **Stav při zapojení (2026-07-17)**: klíč platný, ale účet má **0 kreditů
+  z kvóty 159 644** → ElevenLabs cesta e2e ověřena po quota chybu (reálný
+  401 s českou nápovědou); **fallback ověřen ostře**: auto režim při 0
+  kreditech přepnul a promluvil piperem (první reálná řeč Jarvise), cache
+  hit bez re-syntézy, `--local` funguje. ElevenLabs syntéza proběhne po
+  obnově kvóty: `jarvis say "Dobrý večer, pane."`.
+- **Soukromí**: mluvený text odchází do ElevenLabs — do `say` nepatří nic
+  citlivého; audio cache zůstává lokální (0700 adresář). Piper větev nic
+  neposílá ven (plně offline hlas: `engine = "piper"`).
+
+### 3.9 Hlasový dialog (`converse`) — hlasový kanál, krok 3
+
+Cíl: „Jarvisi, …“ → odpověď nahlas. Spojuje poslech (§3.7), Claude pipeline
+a hlas (§3.8) do dialogu.
+
+**Tok** (worker ve vlákně listen démona, STT nikdy neblokuje):
+
+```
+utterance (whisper) → wake-word filtr (\b<kmen>, default vokativ „jarvisi/jarvise")
+  → fronta (4) → worker: echo-guard (okno vlastní řeči ±1 s) → rozpočet?
+  → ack „Ano, pane?" (cache, okamžité) → claude -p (haiku, max_turns 1,
+    kontext: čas + aktivní okno + poslední 3 výměny z `conversations`)
+  → normalizace pro řeč (1 řádek, ořez na speak.max_chars) → speak (say_once,
+    soubor se po přehrání maže) → costs (component converse) + conversations
+```
+
+Rozhodnutí a proč (2026-07-17):
+- **Wake word = vokativ** („jarvisi", „jarvise") + **fuzzy matching**:
+  normalizace (lowercase, bez diakritiky a mezer) a tolerance 1 editační
+  chyby (`wake_fuzzy`, default zap.) — whisper jméno komolil („Javi si").
+  Druhá půlka řešení je `listen.hint` (whisper initial prompt se jménem
+  „Jarvisi") — po nasazení přepisuje jméno správně i ze syntetického
+  hlasu přes reproduktory. Trade-off fuzzy: občas chytne i skloňované
+  „jarvis" v běžné řeči (vypnutelné).
+- **Jarvis neslyší sám sebe — AEC s far-end referencí**: echo-cancel modul
+  má pojmenovaný sink (`sink_name=jarvis_out` v default.pa) a `speak.sink`
+  směruje VŠECHNU Jarvisovu řeč skrz něj (env `PULSE_SINK` na přehrávači;
+  neexistující sink → warn + výchozí výstup, PULSE_SINK jinak tvrdě selže).
+  Ověřeno kontrolovaným experimentem 2026-07-17: kontrolní fráze přes
+  výchozí sink se přepsala, totéž oslovení přes jarvis_out z přepisu
+  úplně zmizelo (a okolní zvuk prošel). Druhá obrana: **echo-guard
+  časovým oknem** — promluvy začínající před koncem vlastní řeči +1 s
+  se ve workeru zahazují.
+- **Rozpočet sdílený s analýzou** (`analysis.daily_budget_usd`, součet
+  z `costs`); po vyčerpání odpovídá fixní lokální frází bez Clauda.
+  `respect_budget = false` blokaci vypne (útrata se dál jen eviduje) —
+  Daniel má vypnuto (2026-07-17).
+- **`jarvis converse "…" [--mute]`** = stejná výměna textem (test, skript);
+  nevyžaduje wake word ani zapnutý converse.
+- **Warm mozek** (`converse.warm`, default zap.): rezidentní `claude -p
+  --input-format stream-json --output-format stream-json --verbose` proces
+  ve workeru — otázka = JSONL řádek na stdin, odpověď = `result` event.
+  Empiricky: cold spawn 4,1 s (zahřátá OS cache; 15–19 s jen úplně první
+  běh dne), warm otázka 2,2 s (haiku, čisté API); e2e wake→odpověď 6,7 s
+  vč. acku (sonnet). Držený stdin u plain `-p` NEJDE (3s stdin timeout);
+  stream-json timeout nemá (proces přežil 80 s idle před 1. otázkou).
+  `--max-turns 1` platí per zpráva. Session akumuluje kontext (= paměť
+  zdarma, ale rostoucí input tokeny) → recyklace po `warm_max_exchanges`
+  (10) nebo `warm_idle_s` (15 min). Jakákoli chyba → proces zahodit +
+  cold fallback; POZOR na SIGPIPE: main.rs dává démonům (`listen`/`run`)
+  SIG_IGN, jinak by zápis do mrtvého warm procesu zabil celý démon
+  (CLI příkazy nechávají DFL kvůli `jarvis status | head`).
+- **Hint echo-guard**: whisper na hlasité hudbě halucinoval text
+  `listen.hint` do přepisů („…slyšíš? Jarvis odpovídá.") a 2× falešně
+  spustil placenou konverzaci → hint přepsán na slovníkový styl
+  („Slovník: Jarvis, Jarvisi, …" — nezní jako oslovení) a wake ignoruje
+  promluvy sdílející s hintem souvislý úsek ≥ 10 znaků (jméno má 7 →
+  reálné oslovení guard nikdy netrefí).
+- **Ověřeno ostře**: `converse` CLI → skutečný haiku (0,014 USD/výměna)
+  → česká odpověď v persóně (vykání, „pane", suchý humor) → piper nahlas;
+  kontextová paměť potvrzena navazující otázkou; worker + wake-word +
+  fronta + rozpočet pokryté unit testy (87 testů zeleno).
+
+**Open-ear — odpovídání bez wake-wordu (2026-07-18, `converse.open_ear`, default „off"):**
+
+Cíl: umět odpovědět i bez „Jarvisi…", ale neskákat do cizí konverzace. Je to
+addressee detection — jeden stolní mikrofon principiálně neví, na koho mluvíš,
+takže řešení je **vrstvená brána s biasem do ticha** (false-accept = skočení do
+řeči je dražší chyba než false-reject = občas neodpovím). Wake-word zůstává 100%
+override vždy a nezávisle na open_ear.
+
+- **Soukromí/cena beze změny na STT**: každá promluva se přepisuje a ukládá do
+  `utterances` už dnes (kvůli digestu). Open-ear mění jen KDY Jarvis promluví;
+  přidává Claude volání na podmnožinu promluv, ne nový tok do STT.
+- **Triage v STT vlákně** (`converse::triage`, čistá a testovaná), sémantika ve
+  workeru. Tři vrstvy:
+  - *Tier 0 — wake*: „Jarvisi…" → vždy odpoví (beze změny).
+  - *Tier 1 — „followup"*: po Jarvisově odpovědi drží `followup_window_s` (12 s)
+    okno, kdy navazující promluva jméno nepotřebuje. Nejbezpečnější (právě jsi
+    mluvil na Jarvise); okno se obnoví každou odpovědí = víceotáčkový dialog.
+    `speech_end` je **sdílený atomik** worker↔STT vlákno — slouží zároveň jako
+    echo-guard i práh okna. Filtr `open_ear_min_words` zahodí „ehm/jo".
+  - *Tier 2 — „always" (experiment)*: promluvu mimo okno posoudí **skeptický
+    klasifikátor** (haiku, ANO/NE, bias do NE; náklad → costs „converse-gate").
+    Volá se JEN na kandidáty po levných lokálních filtrech (hint-echo guard,
+    min_words, ne echo vlastní řeči) — nikdy na každou promluvu, jinak
+    rozpočtový oheň. Při vyčerpaném rozpočtu kandidát mlčí (neoznamuje „rozpočet
+    vyčerpán" — nebyl osloven).
+- **Kill-gate (empirická brána Tier 2)** — `jarvis converse-eval <jsonl>`:
+  olabelovaný korpus reálných promluv (directed | human | background) →
+  confusion matrix + recall + **false-accept rate**. Šablona z reálné DB:
+  `--from-db N`. „always" se zapíná, až když je false-accept hodně nízko
+  (cíl < 2–3 %), jinak recall nestojí za riziko skákání do řeči. Tier 1 gate
+  nepotřebuje (nemá klasifikátor) — kryjí ho unit testy + ostrý běh.
+- **Meze**: jeden mikrofon = žádný prostorový signál adresace, chyby jsou
+  neredukovatelné. Diarizace přes VAD segmenty nespolehlivá (Scribe ID mluvčích
+  nejsou stabilní napříč voláními). Follow-up může minout, když se hned po
+  odpovědi otočíš na člověka (proto krátké okno). Default „off" = dnešní chování.
+
+### 3.10 Ovládání oken (`jarvis wm`) — ruce Jarvise
+
+Cíl: Jarvis umí hýbat s prostředím — okna, klávesnice, myš, screenshoty. Základ
+pro budoucí automatizace (fáze C/D) a pro hlasové povely typu „Jarvisi, otevři
+Signal a napiš Tomášovi…".
+
+**Vrstvy** (`src/wm.rs`, sdílené X11 helpery v `src/x11util.rs`):
+
+```
+jarvis wm CLI: list | active | focus | close | minimize | maximize | fullscreen
+               | move | resize | wait | spawn | type | key | click | pointer | screenshot
+  ├─ okna: EWMH client messages (_NET_ACTIVE_WINDOW se source=2, _NET_CLOSE_WINDOW,
+  │   _NET_WM_STATE, WM_CHANGE_STATE) + ConfigureWindow; výběr okna: přesná třída
+  │   > podřetězec třídy > podřetězec titulku, remízy řeší stacking (topmost);
+  │   focus čeká na read-back _NET_ACTIVE_WINDOW (fail ≠ tichý úspěch)
+  ├─ klávesnice: XTest fake keys; znak → keysym (Latin-1 přímo, jinak
+  │   0x0100_0000+codepoint); keysym mimo aktuální layout → dočasné zapůjčení
+  │   volného keycodu přes ChangeKeyboardMapping + obnova (trik xdotool)
+  │   → plná česká diakritika nezávisle na rozložení
+  ├─ myš: XTest motion (absolutně) + buttony (levé/prostřední/pravé, dvojklik)
+  └─ screenshot: GetImage root (celek) / crop dle geometrie okna, JPEG q90,
+      konverze pixelů sdílená s capture
+```
+
+Rozhodnutí a proč (2026-07-17):
+- **Nativní Rust místo xdotool/wmctrl subprocess** — žádná runtime závislost,
+  všechna primitiva vracejí read-backy, jeden kód pro CLI i agenta; x11rb už
+  v projektu je (jen +feature `xtest`).
+- **Converse agent dostal ruce**: s `[wm] enabled` má konverzační claude
+  `--allowed-tools "Read,Bash(jarvis wm:*)"` (prefixový vzor — nic jiného než
+  `jarvis wm` spustit nejde) a `converse.max_turns` (12) kol na smyčku
+  akce → screenshot → Read (vision) → další krok. Prompt: seznam příkazů,
+  povinné ověření cílového okna před psaním, stop při nejednoznačném cíli,
+  na závěr shrnutí jednou větou. Bez `[wm]` zůstává Read + 1 kolo jako dřív.
+- **Bezpečnost**: type/key jdou do fokusovaného okna → `type --window` nejdřív
+  aktivuje s ověřením; `[wm] enabled=false` hlasovou větev vypne (CLI zůstává,
+  to spouští člověk). Trade-off vědomě přijatý: agent s klávesnicí je mocný —
+  drží ho prompt + omezený Bash vzor + budget.
+- **`wm spawn` (2026-07-17)**: aplikace, která neběží, se dá spustit —
+  odpojeně (vlastní process group, výstup do spawn.log), detekce úspěchu
+  = NOVÉ okno proti snímku před startem (`--window dotaz` pro single-instance
+  aplikace, které předávají běžící instanci), aktivace best-effort (fullscreen
+  okna umí fokus odmítnout — není to chyba spawnu). Mimo TTY (agent, timery)
+  smí jen programy z `wm.spawn_allowed` (přesná shoda, holé jméno = PATH;
+  žádné basename triky s podvrženou cestou); z terminálu bez omezení.
+- **Ověřeno ostře (2026-07-17)**: gedit — česká věta s plnou diakritikou
+  napsána znak-přesně (52 znaků, stavový řádek „Sl. 53"); dialog neuloženého
+  dokumentu sestřelen klikem dle screenshotu; **Signal Desktop — otevřen 1:1
+  chat Tomáš Messing (klik v sidebaru dle snímku), zpráva napsána, vizuální
+  gate před Enterem (text v poli + správná hlavička), odesláno, read-back
+  screenshot potvrdil bublinu s fajfkou**. Unit testy: keysymy, komba, výběr
+  oken, ořez, gating promptu (102 testů zeleno).
+
+Známé meze: čistě X11 (Wayland mimo rozsah, viz §10); klik podle souřadnic ze
+screenshotu předpokládá, že se scéna mezitím nezměnila (agent má re-shootovat
+při pochybnostech); AltGr znaky mimo core mapu jdou remapem (fungují, jen
+o ~30 ms pomaleji na znak); typing do her/VM s grabem klávesnice negarantován.
+
+### 3.11 SMS kanál (`jarvis sms`) — Twilio
+
+Cíl: Jarvis umí poslat SMS („Jarvisi, až doběhne X, hoď mi SMS") — notifikační
+kanál nezávislý na počítači, doplněk e-mailu a hlasu.
+
+**Tok**: `jarvis sms "text" [--to +420…] [--no-wait]` → Twilio Messages API
+(form-urlencoded POST, Basic auth vlastním base64 — žádná nová závislost;
+retry 0/2/8 s na 429/5xx/transport) → **poll doručenky** (`GET Messages/{sid}`
+à 2 s do `delivered`/timeout 30 s; `failed`/`undelivered` = chyba s Twilio
+kódem a nápovědou) → útrata do `costs` (component `sms`, tokens_in = znaky,
+usd = cena z API, chodí se zpožděním).
+
+Rozhodnutí a proč (2026-07-17):
+- **Odesílatel `MG…` Messaging Service** (`sms.from`): klient pozná MG SID
+  a pošle `MessagingServiceSid` místo `From`; umí i E.164 číslo a alfanumerický
+  sender (validace v configu). Služba „Olvano e-sign" má v poolu jen alpha
+  sender **Olvano** → SMS jsou jednosměrné (nejde odpovědět).
+- **Klíče ze stargate účtu** (`TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`
+  v secrets.env, zkopírováno z ~/Projects/stargate/.env); výchozí příjemce
+  `sms.to = +420733606016` (verified caller ID účtu = Daniel).
+- **Converse agent smí SMS**: s `[sms] enabled` přibude `Bash(jarvis sms:*)`
+  do allowed-tools; prompt: default jde pánovi, cizímu číslu JEN s výslovně
+  nadiktovaným `--to`. `enabled=false` kanál i agentní větev vypne.
+- Pojistky: `sms.max_chars` (default 480 ≈ 3 segmenty), E.164 validace,
+  doctor kontroluje klíče a `--live` zůstatek účtu (Balance API).
+- **Stav ověření (2026-07-17): kód e2e hotový, ale účet zatím žádnou SMS
+  nikdy nedoručil** — historie Messages je 100% failed (i červnové pokusy
+  stargate: 21703/21612/21701 napříč alpha/US číslem/službou; účet je Full,
+  balance 18,6 USD). Diagnóza: **SMS Geographic Permissions pro ČR vypnuté**
+  — nastavuje se JEN v konzoli (Messaging → Settings → Geo permissions),
+  API to neumí. Po zapnutí: `jarvis sms "test"` musí skončit `sent`/
+  `delivered` (kill-gate zůstává otevřený, klient hlásí kódy s nápovědou).
+
+Známé meze: alpha sender = jednosměrka (odpověď nedorazí); cena se do
+`costs` propíše jen když ji Twilio stihne vrátit během poll okna; geo
+permissions bez API = ruční krok v konzoli.
+
 ### 3.4 Konfigurace a tajemství
 
 `~/.config/jarvis/config.toml` (vzor bude v repu jako `config.example.toml`):
@@ -165,15 +485,16 @@ summaries_days = 0           # 0 = navždy (text je maličký)
 ```
 
 Tajemství **výhradně** v `~/.config/jarvis/secrets.env` (0600, adresář 0700):
-`SENDGRID_API_KEY=…`. Načítá se jako env (systemd `EnvironmentFile=%h/.config/jarvis/secrets.env`,
-při ručním spuštění si ho binárka načte sama). V repu nikdy; `.gitignore` pro jistotu
-dostane `*.env`, `secrets*`.
+`SENDGRID_API_KEY=…`, `ELEVENLABS_API_KEY=…`. Načítá se jako env (systemd
+`EnvironmentFile=%h/.config/jarvis/secrets.env`, při ručním spuštění si je binárka
+načte sama). V repu nikdy; `.gitignore` pro jistotu dostane `*.env`, `secrets*`.
 
 ### 3.5 CLI
 
 | Příkaz | Účel |
 |---|---|
 | `jarvis capture` | démon — snímání (foreground, loguje přes `tracing`) |
+| `jarvis listen [--print-only\|--wav F\|--download-model]` | démon — poslech mikrofonu (near-realtime STT) |
 | `jarvis analyze [--dry-run]` | hodinová extrakce (dry-run vypíše prompt a vybrané snímky, nevolá API) |
 | `jarvis digest [--date D] [--send\|--dry-run]` | složí digest; `--dry-run` uloží HTML do souboru k náhledu |
 | `jarvis send-test` | pošle testovací e-mail (ověření SendGrid setupu) |
@@ -182,6 +503,8 @@ dostane `*.env`, `secrets*`.
 | `jarvis doctor` | prereq check: DISPLAY, claude CLI + auth, API key, verifikace odesílatele (test call), místo na disku |
 | `jarvis purge [--older-than 7d]` | ruční retence |
 | `jarvis install-units` | vygeneruje a nainstaluje systemd user units |
+| `jarvis wm <akce>` | ovládání oken/klávesnice/myši + screenshot (EWMH/XTest) — ruce hlasového agenta |
+| `jarvis sms "text" [--to +420…]` | SMS přes Twilio s čekáním na doručenku; smí i hlasový agent |
 
 ### 3.6 systemd user units (`systemd/` v repu, instaluje `install-units`)
 
@@ -200,6 +523,8 @@ Fallback bez systemd: `jarvis run` — vše v jednom procesu s interním plánov
 ```sql
 samples(id, ts, wm_class, title, desktop, idle_ms,
         shot_path NULL, phash NULL)                  -- 1 řádek / 10 s vzorek
+utterances(id, ts_start, ts_end, text, lang, conf,   -- přepisy řeči (poslech);
+        source)                                      -- audio se nikdy neukládá
 hourly_summaries(id, period_start, period_end, json, -- výstup analyze (JSON kontrakt)
         model, cost_usd, degraded BOOL)
 daily_digests(id, date, markdown, html, status,      -- pending|sent|failed
@@ -208,8 +533,15 @@ patterns(id, key, description, evidence, occurrences,-- detekované rutiny (fáz
         first_seen, last_seen,
         status)                                      -- candidate|proposed|approved|automated|dismissed
 proposals(id, pattern_id, kind, path, created_at)    -- vygenerované automatizace (skript/skill/timer)
+runbooks(id, proposal_id UNIQUE, pattern_id, name,   -- schválené automatizace (fáze D)
+        schedule,                                    -- manual | daily@HH:MM
+        enabled, approved_at, approved_via)          -- cli | telegram
+runbook_runs(id, runbook_id, started_at,             -- každý běh; finished_at NULL = běží
+        finished_at, exit_code,                      -- exit NULL = timeout/kill
+        trigger,                                     -- timer | cli | voice
+        output)                                      -- ořezaný stdout+stderr
 costs(id, ts, component, model, tokens_in, tokens_out, usd)
-state(key, value)                                    -- watermarky, pause deadline
+state(key, value)                                    -- watermarky, pause deadline, telegram_offset
 ```
 
 Retence: denně smazat `shots/` starší než `retention.screenshots_days` + odpovídající
@@ -257,7 +589,12 @@ jarvis/
     ├── pipeline/{mod,segment,select,claude,analyze}.rs   # claude.rs = wrapper na `claude -p`
     ├── digest/{mod,build,render}.rs
     ├── mail/sendgrid.rs
-    └── patterns.rs          # fáze B (skeleton od začátku)
+    ├── wm.rs                # ovládání oken/vstupu (EWMH + XTest) — `jarvis wm`, ruce agenta
+    ├── x11util.rs           # sdílené X11 helpery (properties, ZPixmap→RGB, JPEG)
+    ├── sms.rs               # SMS přes Twilio (Messages API, poll doručenky, vlastní base64)
+    ├── patterns.rs          # fáze B+C: detekce vzorů + generování návrhů
+    ├── runbook.rs           # fáze D: schvalování a exekuce runbooků (timeout, flock, runy v DB)
+    └── telegram.rs          # schvalování na dálku (bot getUpdates poll, ověřený chat)
 ```
 
 Závislosti: `clap` (derive), `tokio` (rt, process, time), `xcap`, `x11rb`
@@ -292,12 +629,19 @@ Odhad: M0–M1 ~1 den, M2 ~1 den, M3 ~0,5 dne, M4 ~0,5 dne.
   timeline detekovat opakované rutiny (stejná sekvence aplikací/úloh ≥3× týdně, ruční
   přenosy dat, opakované dotazy). Ukládat do `patterns`, v digestu sekce „Automatizační
   příležitosti" s odhadem ušetřeného času.
-- **C — Návrhy artefaktů**: pro schválené vzory Jarvis přes `claude -p` rovnou vygeneruje
-  automatizaci — shell/Rust skript, systemd timer, Claude Code skill či workflow — do
-  `~/.local/share/jarvis/proposals/`, odkaz v digestu. Instalace = moje schválení.
-- **D — Řízená exekuce**: schválené runbooky spouští Jarvis sám (timer/event), výsledky
-  reportuje v digestu. Vše s vnějšími efekty zůstává approval-gated; rozšíření kanálů
-  (Telegram bot už je v prostředí) pro schvalování „na dálku".
+- **C — Návrhy artefaktů** *(hotové)*: pro vzory Jarvis přes `claude -p` vygeneruje
+  automatizaci — shell skript, systemd timer, Claude Code skill — do
+  `~/.local/share/jarvis/proposals/` (`jarvis propose`), odkaz v digestu; nový návrh
+  se ohlašuje na Telegram/SMS (dle configu). Instalace/spouštění = moje schválení.
+- **D — Řízená exekuce** *(hotové 2026-07-17)*: `jarvis runbook approve <návrh>` udělá
+  z návrhu runbook (approve chce TTY — agent ani timer schválit nemůžou; na dálku
+  z ověřeného Telegram chatu: „schval N“ / „zamítni N“, bot návrhy ohlašuje sám).
+  Spouštění: ručně/hlasem (`jarvis runbook run`, hlasový agent má povolené jen
+  run/list/show — nikdy approve) a plánovaně `schedule daily@HH:MM` přes
+  `jarvis-runbooks.timer` (à 5 min, `runbook run-due`; `jarvis run` má stejnou otočku).
+  Každý běh: flock proti souběhu, tvrdý timeout (SIGKILL process group), výstup
+  ořezaný do DB (`runbook_runs`) → sekce „Automatizace (runbooky)“ v digestu,
+  `jarvis runbook runs`, `jarvis status`. Bez schválení neběží nic.
 
 ---
 
@@ -313,3 +657,20 @@ Odhad: M0–M1 ~1 den, M2 ~1 den, M3 ~0,5 dne, M4 ~0,5 dne.
 - Defaulty: snímek à 60 s · digest 19:00 Europe/Prague · retence snímků 7 dní ·
   Haiku na hodinovku, default model na digest · 1 monitor (multi-monitor: `xcap`
   umí všechny, zapneme až bude víc než HDMI-0).
+- **Poslech**: energy-VAD neumí odlišit řeč od trvalého hluku (řeší až whisper
+  no-speech filtr → zbytečné CPU) — upgrade na Silero VAD až to bude reálně
+  vadit. Reproduktory nejsou odposlouchávané (jen mikrofon; schůzky v
+  sluchátkách slyší jen moji stranu — monitor source je případné rozšíření).
+  Build vyžaduje user-space cmake+libclang (pip), viz README/`.cargo/config.toml`.
+- **Runbooky/Telegram**: schvalovací bot je vlastní (@BotFather); token + chat id
+  v secrets.env (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`), poslouchá se výhradně
+  nakonfigurovaný chat. Poll jede v 5min timeru → schválení na dálku má latenci
+  do 5 minut. Skripty runbooků běží s právy uživatele bez sandboxu — proto je
+  brána na schválení (přečti si artefakt: `jarvis runbook show/pending`).
+- **Hlas (TTS)**: účet ElevenLabs měl při zapojení 0 kreditů → finální doladění
+  hlasu (poslechový A/B test George vs. hlas z Voice Library) čeká na obnovu
+  kvóty; do té doby mluví lokální piper záloha (funkční, ověřeno ostře).
+  Klíč je scoped na `text_to_speech` — správa hlasů jen přes web;
+  klíč byl vložen do chatu v plaintextu → **po zprovoznění zrotovat** (stejně
+  jako SendGrid, viz §5). Digest ohláška mluví na stroji s audio výstupem
+  (obě cesty: systemd timer i `jarvis run`).

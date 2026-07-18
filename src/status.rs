@@ -47,6 +47,25 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         _ => check(false, "DISPLAY", "není nastaveno — capture nemůže běžet".into()),
     }
 
+    // ovládání oken (wm): EWMH + XTest pro syntetický vstup
+    match crate::wm::Wm::connect(cfg.wm.key_delay_ms) {
+        Ok(w) => match w.ensure_xtest() {
+            Ok(()) => {
+                let n = w.windows().map(|v| v.len()).unwrap_or(0);
+                check(
+                    true,
+                    "ovládání oken (wm)",
+                    format!(
+                        "XTest OK, {n} oken; converse agent: {}",
+                        if cfg.wm.enabled { "povolen" } else { "vypnut ([wm] enabled=false)" }
+                    ),
+                );
+            }
+            Err(e) => check(false, "ovládání oken (wm)", format!("{e:#}")),
+        },
+        Err(e) => check(false, "ovládání oken (wm)", format!("{e:#}")),
+    }
+
     // claude CLI
     match Command::new("claude").arg("--version").output() {
         Ok(out) if out.status.success() => {
@@ -76,6 +95,46 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         Err(e) => check(false, "SendGrid klíč", format!("{e:#}")),
     }
 
+    // runbooky (fáze D): spustitelnost + kanál pro schvalování na dálku
+    if cfg.runbooks.enabled {
+        let conn_check = db::open(&paths.db_path);
+        match conn_check {
+            Ok(conn) => {
+                let n = crate::runbook::all(&conn).map(|v| v.len()).unwrap_or(0);
+                let pending = crate::runbook::pending_proposals(&conn).map(|v| v.len()).unwrap_or(0);
+                check(
+                    true,
+                    "runbooky",
+                    format!(
+                        "{n} schválených, {pending} návrhů čeká; hlasové spouštění: {}",
+                        if cfg.runbooks.voice_run { "povoleno" } else { "vypnuto" }
+                    ),
+                );
+            }
+            Err(e) => check(false, "runbooky", format!("DB nejde otevřít: {e:#}")),
+        }
+        if cfg.runbooks.telegram_approve {
+            match config::telegram_keys(paths) {
+                Ok(_) => check(true, "Telegram (schvalování)", "klíče nalezeny".into()),
+                Err(e) => check(false, "Telegram (schvalování)", format!("{e:#}")),
+            }
+        }
+    }
+
+    // Twilio (SMS)
+    if cfg.sms.enabled {
+        match config::twilio_keys(paths) {
+            Ok(_) => check(
+                true,
+                "Twilio klíče (SMS)",
+                format!("nalezeny; from {}, výchozí příjemce {}", cfg.sms.from, cfg.sms.to),
+            ),
+            Err(e) => check(false, "Twilio klíče (SMS)", format!("{e:#}")),
+        }
+    } else {
+        check(true, "SMS", "vypnuty v configu".into());
+    }
+
     // DB
     match db::open(&paths.db_path) {
         Ok(conn) => {
@@ -89,6 +148,141 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
     let (bytes, files) = util::dir_size(&paths.shots_dir);
     check(true, "screenshoty", format!("{files} souborů, {}", util::human_bytes(bytes)));
 
+    // poslech
+    if cfg.listen.enabled {
+        let l = &cfg.listen;
+        check(
+            true,
+            "STT engine",
+            match l.engine.as_str() {
+                "whisper" => "whisper (lokální)".into(),
+                "elevenlabs" => format!("ElevenLabs Scribe ({}), bez fallbacku", l.scribe_model),
+                _ => format!("auto: Scribe ({}) → whisper fallback", l.scribe_model),
+            },
+        );
+        // ElevenLabs klíč pro Scribe (engine auto/elevenlabs)
+        if l.engine != "whisper" {
+            match config::elevenlabs_key(paths) {
+                Ok(_) => check(true, "ElevenLabs klíč (Scribe)", "nalezen".into()),
+                Err(e) => check(false, "ElevenLabs klíč (Scribe)", format!("{e:#}")),
+            }
+        }
+        // whisper model: nutný pro engine "whisper", fallback pro "auto"
+        if l.engine != "elevenlabs" {
+            let model = l.resolve_model_path(paths);
+            let label = if l.engine == "whisper" { "whisper model" } else { "whisper model (fallback)" };
+            match std::fs::metadata(&model) {
+                Ok(m) => check(
+                    true,
+                    label,
+                    format!("{} ({})", model.display(), util::human_bytes(m.len())),
+                ),
+                Err(_) => check(
+                    false,
+                    label,
+                    format!("{} chybí — `jarvis listen --download-model`", model.display()),
+                ),
+            }
+        }
+        let audio_tool = ["parec", "arecord"]
+            .iter()
+            .find(|b| Command::new(*b).arg("--version").output().is_ok());
+        check(
+            audio_tool.is_some(),
+            "audio nástroj",
+            audio_tool
+                .map(|b| (*b).to_string())
+                .unwrap_or_else(|| "chybí parec i arecord (pulseaudio-utils / alsa-utils)".into()),
+        );
+        // zámek obrazovky: mic démon se pauzuje, když je aktivní screensaver
+        if cfg.listen.pause_when_locked {
+            match crate::screen::probe() {
+                crate::screen::Lock::Active => {
+                    check(true, "zámek obrazovky", "detekce OK — teď UZAMČENO (poslech pauzuje)".into())
+                }
+                crate::screen::Lock::Inactive => check(
+                    true,
+                    "zámek obrazovky",
+                    "detekce OK, teď odemčeno — při zámku se poslech pozastaví".into(),
+                ),
+                crate::screen::Lock::Unknown(why) => check(
+                    true,
+                    "zámek obrazovky",
+                    format!("⚠ stav nezjistím ({why}) — poslech se při zámku NEpozastaví (fail-open)"),
+                ),
+            }
+        } else {
+            check(true, "zámek obrazovky", "pause_when_locked=false — poslech běží i při zámku".into());
+        }
+    } else {
+        check(true, "poslech", "vypnut v configu".into());
+    }
+
+    // hlas (TTS): ElevenLabs a/nebo lokální piper podle engine
+    if cfg.speak.enabled {
+        if cfg.speak.engine != "piper" {
+            match config::elevenlabs_key(paths) {
+                Ok(_) => check(true, "ElevenLabs klíč", "nalezen".into()),
+                Err(e) => check(false, "ElevenLabs klíč", format!("{e:#}")),
+            }
+        }
+        if cfg.speak.engine != "elevenlabs" {
+            let piper_ok = Command::new(&cfg.speak.piper_bin)
+                .arg("--help")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            check(
+                piper_ok,
+                "piper (lokální TTS)",
+                if piper_ok {
+                    cfg.speak.piper_bin.clone()
+                } else {
+                    format!("'{}' nefunguje — `pip3 install --user piper-tts`", cfg.speak.piper_bin)
+                },
+            );
+            let model = crate::speak::piper::model_path(paths, &cfg.speak);
+            match std::fs::metadata(&model) {
+                Ok(m) => check(
+                    true,
+                    "piper hlas",
+                    format!("{} ({})", model.display(), util::human_bytes(m.len())),
+                ),
+                Err(_) => check(
+                    false,
+                    "piper hlas",
+                    format!("{} chybí — `jarvis say --download-model`", model.display()),
+                ),
+            }
+        }
+        match crate::speak::detect_player(&cfg.speak.player) {
+            Some(p) => check(true, "audio přehrávač", p),
+            None => check(
+                false,
+                "audio přehrávač",
+                "chybí ffplay/mpv/ffmpeg+paplay — nainstaluj, nebo nastav speak.player".into(),
+            ),
+        }
+        if !cfg.speak.sink.is_empty() {
+            let ok = crate::speak::sink_available(&cfg.speak.sink);
+            check(
+                ok,
+                "audio sink (AEC reference)",
+                if ok {
+                    cfg.speak.sink.clone()
+                } else {
+                    format!(
+                        "'{}' neexistuje — zkontroluj sink_name u module-echo-cancel \
+                         v ~/.config/pulse/default.pa (řeč jde zatím na výchozí výstup)",
+                        cfg.speak.sink
+                    )
+                },
+            );
+        }
+    } else {
+        check(true, "hlas", "vypnut v configu".into());
+    }
+
     if live {
         match config::sendgrid_key(paths) {
             Ok(key) => match crate::mail::sendgrid::sandbox_check(&cfg.email, &key) {
@@ -100,6 +294,57 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         match crate::pipeline::claude::ping(&cfg.analysis.model) {
             Ok(v) => check(true, "claude -p (ping)", v),
             Err(e) => check(false, "claude -p (ping)", format!("{e:#}")),
+        }
+        // kredity zajímají TTS (speak) i Scribe STT (listen) — sdílí účet
+        let uses_elevenlabs = (cfg.speak.enabled && cfg.speak.engine != "piper")
+            || (cfg.listen.enabled && cfg.listen.engine != "whisper");
+        if uses_elevenlabs {
+            match config::elevenlabs_key(paths) {
+                Ok(key) => match crate::speak::tts::credits(&key) {
+                    Ok(crate::speak::tts::Credits::Known { used, limit }) => {
+                        let left = limit.saturating_sub(used);
+                        check(
+                            left > 0,
+                            "ElevenLabs kredity",
+                            format!("{left} zbývá ({used}/{limit} použito)"),
+                        );
+                    }
+                    Ok(crate::speak::tts::Credits::NoPermission) => check(
+                        true,
+                        "ElevenLabs kredity",
+                        "klíč platný; je scoped bez user_read, zůstatek nevidím".into(),
+                    ),
+                    Err(e) => check(false, "ElevenLabs kredity", format!("{e:#}")),
+                },
+                Err(_) => check(false, "ElevenLabs kredity", "bez klíče nelze ověřit".into()),
+            }
+        }
+        if cfg.sms.enabled {
+            match config::twilio_keys(paths) {
+                Ok((sid, token)) => match crate::sms::balance(&sid, &token) {
+                    Ok(b) => check(true, "Twilio zůstatek", b),
+                    Err(e) => check(false, "Twilio zůstatek", format!("{e:#}")),
+                },
+                Err(_) => check(false, "Twilio zůstatek", "bez klíčů nelze ověřit".into()),
+            }
+        }
+        if cfg.listen.enabled {
+            // 3 s: webrtc zdroj dává novému klientovi první ~2 s nuly (warm-up)
+            match crate::listen::audio::probe_level(&cfg.listen.device, 3.0) {
+                Ok((dbfs, peak)) => {
+                    let has_signal = peak >= 3;
+                    check(
+                        has_signal,
+                        "mikrofon (3 s poslech)",
+                        if has_signal {
+                            format!("úroveň {dbfs:.0} dBFS, peak {peak}")
+                        } else {
+                            format!("digitální ticho (peak {peak}) — odpojen/mute?")
+                        },
+                    );
+                }
+                Err(e) => check(false, "mikrofon (1,5 s poslech)", format!("{e:#}")),
+            }
         }
     }
 
@@ -151,6 +396,109 @@ pub fn status(paths: &Paths, cfg: &Config) -> Result<()> {
         |r| r.get(0),
     )?;
     println!("  dnes:           {samples_today} vzorků, {shots_today} screenshotů");
+
+    if !cfg.listen.enabled {
+        println!("  poslech:        vypnut v configu");
+    } else if !cfg.listen.resolve_model_path(paths).exists() {
+        println!("  poslech:        model chybí — `jarvis listen --download-model`");
+    } else {
+        let alive = db::state_get_i64(&conn, "listen_alive_ts")?
+            .map(|t| now - t <= 150)
+            .unwrap_or(false);
+        let utt_today = db::utterance_count_since(&conn, day_start)?;
+        println!(
+            "  poslech:        {}; dnes {utt_today} promluv",
+            if alive { "běží" } else { "neběží (démon nehlásí tep)" }
+        );
+        if db::state_get(&conn, "listen_silent")?.is_some() {
+            println!("                  ⚠ mikrofon nedodává signál (digitální ticho)");
+        }
+        match db::last_utterance(&conn)? {
+            Some((ts, text)) => println!(
+                "  poslední řeč:   {} — „{}“",
+                util::fmt_local(ts),
+                util::truncate_chars(&text, 60)
+            ),
+            None => println!("  poslední řeč:   zatím žádná"),
+        }
+    }
+
+    if cfg.speak.enabled {
+        let (bytes, files) = util::dir_size(&paths.tts_cache_dir);
+        let engine = match cfg.speak.engine.as_str() {
+            "piper" => format!("lokální piper ({})", cfg.speak.piper_voice),
+            "elevenlabs" => format!("ElevenLabs ({})", cfg.speak.voice_id),
+            _ => format!("ElevenLabs ({}) + piper záloha", cfg.speak.voice_id),
+        };
+        println!(
+            "  hlas:           zapnut — {engine}, cache {files} frází ({})",
+            util::human_bytes(bytes)
+        );
+    } else {
+        println!("  hlas:           vypnut v configu");
+    }
+
+    if cfg.converse.enabled {
+        let convos_today = db::conversation_count_since(&conn, day_start)?;
+        println!(
+            "  konverzace:     zapnuta — oslovení „{}“; dnes {convos_today} výměn",
+            cfg.converse.wake_words.join("“ / „")
+        );
+    } else {
+        println!("  konverzace:     vypnuta v configu");
+    }
+
+    println!(
+        "  ovládání oken:  {}",
+        if cfg.wm.enabled {
+            "zapnuto — hlasový agent smí `jarvis wm` (okna, klávesnice, myš)"
+        } else {
+            "pro agenta vypnuto (CLI `jarvis wm` funguje vždy)"
+        }
+    );
+
+    if cfg.sms.enabled {
+        println!("  sms:            zapnuty — {} → {}", cfg.sms.from, cfg.sms.to);
+    } else {
+        println!("  sms:            vypnuty v configu");
+    }
+
+    if cfg.runbooks.enabled {
+        let rbs = crate::runbook::all(&conn)?;
+        let active = rbs.iter().filter(|r| r.enabled).count();
+        let pending = crate::runbook::pending_proposals(&conn)?.len();
+        let last_run = crate::runbook::recent_runs(&conn, 1)?.into_iter().next();
+        let last_txt = match last_run {
+            Some(r) => format!(
+                "poslední běh {} „{}“ {}",
+                util::fmt_local(r.started_at),
+                r.name,
+                match (r.finished_at, r.exit_code) {
+                    (Some(_), Some(0)) => "✓".into(),
+                    (Some(_), Some(c)) => format!("✗ exit {c}"),
+                    (Some(_), None) => "✗ timeout".into(),
+                    (None, _) => "⚠ nedoběhl".into(),
+                }
+            ),
+            None => "zatím žádný běh".into(),
+        };
+        println!(
+            "  runbooky:       {active} aktivních ({} celkem), {pending} návrhů čeká; {last_txt}",
+            rbs.len()
+        );
+        if cfg.runbooks.telegram_approve {
+            println!(
+                "                  vzdálené schvalování: Telegram {}",
+                if config::telegram_keys(paths).is_ok() {
+                    "nakonfigurován"
+                } else {
+                    "⚠ chybí TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID v secrets.env"
+                }
+            );
+        }
+    } else {
+        println!("  runbooky:       vypnuty v configu");
+    }
 
     let last_summary: Option<i64> = conn
         .query_row(

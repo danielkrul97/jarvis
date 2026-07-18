@@ -1,4 +1,4 @@
-use crate::config::Paths;
+use crate::config::{Config, Paths};
 use crate::pipeline::claude::{self, ClaudeRequest};
 use crate::store::db;
 use crate::util;
@@ -154,8 +154,9 @@ pub fn print_list(conn: &Connection) -> Result<()> {
 }
 
 /// Vygeneruje artefakt automatizace pro vzor (výchozí: nejčastější kandidát)
-/// do proposals/ a označí vzor jako `proposed`.
-pub fn propose(paths: &Paths, conn: &Connection, id: Option<i64>) -> Result<()> {
+/// do proposals/, označí vzor jako `proposed` a ohlásí ho na nakonfigurované
+/// kanály (Telegram/SMS — schvalování na dálku).
+pub fn propose(paths: &Paths, cfg: &Config, conn: &Connection, id: Option<i64>) -> Result<()> {
     let pat = match id {
         Some(i) => get(conn, i)?.with_context(|| format!("vzor #{i} neexistuje (viz --list)"))?,
         None => best_candidate(conn)?
@@ -217,13 +218,18 @@ pub fn propose(paths: &Paths, conn: &Connection, id: Option<i64>) -> Result<()> 
         "INSERT INTO proposals(pattern_id, kind, path, created_at) VALUES(?1, ?2, ?3, ?4)",
         params![pat.id, p.kind, path.display().to_string(), util::now_ts()],
     )?;
+    let proposal_id = conn.last_insert_rowid();
     set_status(conn, pat.id, "proposed")?;
+    crate::runbook::announce_proposal(paths, cfg, conn, proposal_id, &p.kind, &pat.description);
 
-    println!("✓ Návrh uložen: {}", path.display());
+    println!("✓ Návrh #{proposal_id} uložen: {}", path.display());
     println!("  Typ:       {}", p.kind);
     println!("  Popis:     {}", p.description);
     println!("  Nasazení:  {}", p.install_hint);
-    println!("  (Nic se neinstaluje samo — nasazení je na tobě.)");
+    println!("  (Nic se neinstaluje ani nespouští samo — rozhodnutí je na tobě.)");
+    if p.kind == "shell-script" || fname.ends_with(".sh") {
+        println!("  Ke spouštění schválíš: jarvis runbook approve {proposal_id}");
+    }
     Ok(())
 }
 

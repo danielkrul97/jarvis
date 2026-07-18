@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 const SCHEMA_V1: &str = r#"
-CREATE TABLE samples(
+CREATE TABLE IF NOT EXISTS samples(
   id INTEGER PRIMARY KEY,
   ts INTEGER NOT NULL,
   wm_class TEXT NOT NULL DEFAULT '',
@@ -13,9 +13,9 @@ CREATE TABLE samples(
   shot_path TEXT,
   phash INTEGER
 );
-CREATE INDEX idx_samples_ts ON samples(ts);
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 
-CREATE TABLE hourly_summaries(
+CREATE TABLE IF NOT EXISTS hourly_summaries(
   id INTEGER PRIMARY KEY,
   period_start INTEGER NOT NULL,
   period_end INTEGER NOT NULL,
@@ -24,9 +24,9 @@ CREATE TABLE hourly_summaries(
   cost_usd REAL NOT NULL DEFAULT 0,
   degraded INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_summaries_period ON hourly_summaries(period_start);
+CREATE INDEX IF NOT EXISTS idx_summaries_period ON hourly_summaries(period_start);
 
-CREATE TABLE daily_digests(
+CREATE TABLE IF NOT EXISTS daily_digests(
   id INTEGER PRIMARY KEY,
   date TEXT NOT NULL UNIQUE,
   markdown TEXT NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE daily_digests(
   sent_at INTEGER
 );
 
-CREATE TABLE patterns(
+CREATE TABLE IF NOT EXISTS patterns(
   id INTEGER PRIMARY KEY,
   key TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL,
@@ -47,7 +47,7 @@ CREATE TABLE patterns(
   status TEXT NOT NULL DEFAULT 'candidate'
 );
 
-CREATE TABLE proposals(
+CREATE TABLE IF NOT EXISTS proposals(
   id INTEGER PRIMARY KEY,
   pattern_id INTEGER REFERENCES patterns(id),
   kind TEXT NOT NULL,
@@ -55,7 +55,7 @@ CREATE TABLE proposals(
   created_at INTEGER NOT NULL
 );
 
-CREATE TABLE costs(
+CREATE TABLE IF NOT EXISTS costs(
   id INTEGER PRIMARY KEY,
   ts INTEGER NOT NULL,
   component TEXT NOT NULL,
@@ -64,9 +64,9 @@ CREATE TABLE costs(
   tokens_out INTEGER NOT NULL DEFAULT 0,
   usd REAL NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_costs_ts ON costs(ts);
+CREATE INDEX IF NOT EXISTS idx_costs_ts ON costs(ts);
 
-CREATE TABLE state(
+CREATE TABLE IF NOT EXISTS state(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
@@ -84,8 +84,22 @@ fn init(conn: &Connection) -> Result<()> {
     // journal_mode pragma vrací řádek, proto query_row místo pragma_update
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // FK se ve SQLite musí zapínat per-spojení (a mimo transakci) — jinak jsou
+    // REFERENCES v runbooks/runbook_runs jen deklarace bez vynucení
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     migrate(conn)?;
     Ok(())
+}
+
+/// Existuje sloupec v tabulce? (idempotence ALTER … ADD COLUMN migrací —
+/// ADD COLUMN nezná IF NOT EXISTS, takže partial rerun jinak spadne.)
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    Ok(found)
 }
 
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -104,6 +118,81 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         )
         .context("migrace v2 selhala")?;
         conn.pragma_update(None, "user_version", 2)?;
+    }
+    if version < 3 {
+        // poslech mikrofonu: přepisy promluv (audio se neukládá nikdy)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS utterances(
+               id INTEGER PRIMARY KEY,
+               ts_start INTEGER NOT NULL,
+               ts_end INTEGER NOT NULL,
+               text TEXT NOT NULL,
+               lang TEXT NOT NULL DEFAULT '',
+               conf REAL NOT NULL DEFAULT 0,
+               source TEXT NOT NULL DEFAULT 'mic'
+             );
+             CREATE INDEX IF NOT EXISTS idx_utterances_ts ON utterances(ts_start);",
+        )
+        .context("migrace v3 selhala")?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        // hlasový dialog: otázka z mikrofonu → odpověď Clauda (mluví se nahlas)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversations(
+               id INTEGER PRIMARY KEY,
+               ts INTEGER NOT NULL,
+               question TEXT NOT NULL,
+               answer TEXT NOT NULL,
+               model TEXT NOT NULL DEFAULT '',
+               cost_usd REAL NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_conversations_ts ON conversations(ts);",
+        )
+        .context("migrace v4 selhala")?;
+        conn.pragma_update(None, "user_version", 4)?;
+    }
+    if version < 5 {
+        // fáze D: schválený návrh = runbook; každý běh se zapisuje (read-back
+        // pro digest/status; poslední běh řídí plánovač run-due)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS runbooks(
+               id INTEGER PRIMARY KEY,
+               proposal_id INTEGER NOT NULL UNIQUE REFERENCES proposals(id),
+               pattern_id INTEGER REFERENCES patterns(id),
+               name TEXT NOT NULL,
+               schedule TEXT NOT NULL DEFAULT 'manual',
+               enabled INTEGER NOT NULL DEFAULT 1,
+               approved_at INTEGER NOT NULL,
+               approved_via TEXT NOT NULL DEFAULT 'cli'
+             );
+             CREATE TABLE IF NOT EXISTS runbook_runs(
+               id INTEGER PRIMARY KEY,
+               runbook_id INTEGER NOT NULL REFERENCES runbooks(id),
+               started_at INTEGER NOT NULL,
+               finished_at INTEGER,
+               exit_code INTEGER,
+               trigger TEXT NOT NULL DEFAULT 'cli',
+               output TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX IF NOT EXISTS idx_runbook_runs_started ON runbook_runs(started_at);",
+        )
+        .context("migrace v5 selhala")?;
+        conn.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        // integrita schválení: otisk artefaktu se zafixuje při approve a ověří
+        // před každou exekucí — po schválení už skript nejde nepozorovaně
+        // podvrhnout (jinak timer/hlas spustí změněný obsah bez re-approvu).
+        // ADD COLUMN nezná IF NOT EXISTS → guard přes column_exists (idempotence).
+        if !column_exists(conn, "runbooks", "artifact_sha256")? {
+            conn.execute(
+                "ALTER TABLE runbooks ADD COLUMN artifact_sha256 TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .context("migrace v6 selhala")?;
+        }
+        conn.pragma_update(None, "user_version", 6)?;
     }
     Ok(())
 }
@@ -190,6 +279,88 @@ pub fn samples_between(conn: &Connection, from: i64, to: i64) -> Result<Vec<Samp
     Ok(rows)
 }
 
+// ---------- utterances (poslech) ----------
+
+/// Přepis promluvy pro čtení. Zatím konzumují jen testy — napojení na
+/// hodinovou analýzu je další krok (PLAN §3.7), pak `allow` zmizí.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct UtteranceRow {
+    pub ts_start: i64,
+    pub ts_end: i64,
+    pub text: String,
+    pub lang: String,
+    pub conf: f64,
+}
+
+pub fn insert_utterance(
+    conn: &Connection,
+    ts_start: i64,
+    ts_end: i64,
+    text: &str,
+    lang: &str,
+    conf: f64,
+    source: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO utterances(ts_start, ts_end, text, lang, conf, source)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![ts_start, ts_end, text, lang, conf, source],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)] // viz UtteranceRow
+pub fn utterances_between(conn: &Connection, from: i64, to: i64) -> Result<Vec<UtteranceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts_start, ts_end, text, lang, conf
+         FROM utterances WHERE ts_start >= ?1 AND ts_start < ?2 ORDER BY ts_start",
+    )?;
+    let rows = stmt
+        .query_map(params![from, to], |r| {
+            Ok(UtteranceRow {
+                ts_start: r.get(0)?,
+                ts_end: r.get(1)?,
+                text: r.get(2)?,
+                lang: r.get(3)?,
+                conf: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn last_utterance(conn: &Connection) -> Result<Option<(i64, String)>> {
+    conn.query_row(
+        "SELECT ts_start, text FROM utterances ORDER BY ts_start DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Texty posledních `limit` mic promluv (nejnovější první) — šablona korpusu
+/// pro open-ear kill-gate (`jarvis converse-eval --from-db`).
+pub fn recent_utterance_texts(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT text FROM utterances WHERE source = 'mic' ORDER BY ts_start DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn utterance_count_since(conn: &Connection, since: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM utterances WHERE ts_start >= ?1",
+        params![since],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
 // ---------- hourly summaries ----------
 
 #[derive(Debug, Clone)]
@@ -226,6 +397,46 @@ pub fn summaries_between(conn: &Connection, from: i64, to: i64) -> Result<Vec<Su
         })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
+}
+
+// ---------- conversations ----------
+
+pub fn insert_conversation(
+    conn: &Connection,
+    ts: i64,
+    question: &str,
+    answer: &str,
+    model: &str,
+    cost_usd: f64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO conversations(ts, question, answer, model, cost_usd)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![ts, question, answer, model, cost_usd],
+    )?;
+    Ok(())
+}
+
+/// Posledních `limit` výměn, chronologicky (nejstarší první) — kontext
+/// pro navazující otázky.
+pub fn recent_conversations(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT question, answer FROM conversations ORDER BY ts DESC, id DESC LIMIT ?1",
+    )?;
+    let mut rows: Vec<(String, String)> = stmt
+        .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.reverse();
+    Ok(rows)
+}
+
+pub fn conversation_count_since(conn: &Connection, since_ts: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE ts >= ?1",
+        params![since_ts],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
 }
 
 // ---------- costs ----------
@@ -360,7 +571,23 @@ mod tests {
         let conn = test_conn();
         migrate(&conn).unwrap(); // druhé volání nesmí spadnout
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 6);
+    }
+
+    #[test]
+    fn utterances_roundtrip() {
+        let conn = test_conn();
+        insert_utterance(&conn, 100, 105, "ahoj světe", "cs", 0.92, "mic").unwrap();
+        insert_utterance(&conn, 200, 203, "hello", "en", 0.85, "wav").unwrap();
+        let rows = utterances_between(&conn, 0, 1000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "ahoj světe");
+        assert_eq!(rows[0].lang, "cs");
+        assert!((rows[0].conf - 0.92).abs() < 1e-9);
+        assert_eq!(last_utterance(&conn).unwrap().unwrap().0, 200);
+        assert_eq!(utterance_count_since(&conn, 150).unwrap(), 1);
+        // konec intervalu exkluzivní
+        assert_eq!(utterances_between(&conn, 100, 200).unwrap().len(), 1);
     }
 
     #[test]
