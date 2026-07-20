@@ -752,6 +752,27 @@ pub fn cost_since_like(conn: &Connection, like: &str, since: i64) -> Result<f64>
     .map_err(Into::into)
 }
 
+/// Count of improvement draft-attempts since `since` (any status past 'queued'
+/// touched in range) — input to the daily attempt cap.
+pub fn improvement_attempts_since(conn: &Connection, since: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM improvements WHERE updated_at >= ?1 AND status <> 'queued'",
+        params![since],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Improvements touched since `since` (for the daily digest section).
+pub fn improvements_since(conn: &Connection, since: i64) -> Result<Vec<ImprovementRow>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {IMPR_COLS} FROM improvements WHERE updated_at >= ?1 ORDER BY id DESC"))?;
+    let rows = stmt
+        .query_map(params![since], improvement_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The last `limit` nudges (listing in `status`).
 pub fn recent_nudges(conn: &Connection, limit: usize) -> Result<Vec<NudgeRow>> {
     let mut stmt =

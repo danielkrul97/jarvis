@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tools handed to the codegen agent inside the worktree: it may read, edit,
 /// write, and build/test — but NOT run git (Jarvis owns every git operation and
@@ -301,7 +301,7 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
             if dry_run {
                 run_dry(cfg, conn)
             } else {
-                bail!("automatická smyčka je fáze 5 — zatím spouštěj kroky ručně (draft → test → propose → approve)")
+                tick(paths, cfg, conn)
             }
         }
         ImproveCmd::Draft { id, dry_run } => draft(paths, cfg, conn, id, dry_run),
@@ -314,6 +314,155 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
 
 fn not_yet(phase: u8, what: &str) -> Result<()> {
     bail!("„{what}“ je fáze {phase} — v tomto buildu ještě neimplementováno (ship-dark scaffold)")
+}
+
+// ---------- email notifications (send-only channel) ----------
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Sends a plain notification via SendGrid (the improve layer's one-way channel;
+/// approval stays at the keyboard). Errors propagate — callers treat it as
+/// best-effort so a mail hiccup never blocks the pipeline.
+fn email_notify(paths: &Paths, cfg: &Config, subject: &str, body_md: &str) -> Result<()> {
+    let key = crate::config::sendgrid_key(paths)?;
+    let html = format!(
+        "<div style=\"font-family:sans-serif;max-width:640px\"><pre style=\"white-space:pre-wrap;\
+         font-family:inherit\">{}</pre></div>",
+        html_escape(body_md)
+    );
+    crate::mail::sendgrid::send(&cfg.email, &key, subject, body_md, &html)
+        .context("SendGrid odeslání selhalo")?;
+    Ok(())
+}
+
+/// Emails a ready-for-approval proposal. The mail carries the review command and
+/// the approve command, but is explicit that approval happens at the keyboard.
+fn notify_proposed(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow) {
+    let repo = repo_root(cfg);
+    let subject = format!("Jarvis: návrh vylepšení #{} — {}", imp.id, util::truncate_chars(&imp.title, 60));
+    let gate_warn = if imp.envelope == ENV_GATE_CRITICAL {
+        "\n⚠ Sahá na bezpečnostní/gate soubory — pečlivá revize!"
+    } else {
+        ""
+    };
+    let body = format!(
+        "Jarvis navrhuje vylepšení VLASTNÍHO kódu (napsal a otestoval si ho sám, testy zeleno).\n\n\
+         #{}  {}\n\
+         obálka: {}{}\n\
+         diff:   {}\n\
+         otisk:  {}…\n\n\
+         Revize:   git -C {} diff {} {}\n\
+         Schválit: jarvis improve approve {}   (jen u klávesnice — tenhle mail je oznámení, ne brána)\n\
+         Zahodit:  jarvis improve dismiss {}\n",
+        imp.id,
+        imp.title,
+        imp.envelope,
+        gate_warn,
+        imp.diff_stat,
+        short(&imp.diff_sha256),
+        repo.display(),
+        short(&imp.base_commit),
+        short(&imp.head_commit),
+        imp.id,
+        imp.id,
+    );
+    match email_notify(paths, cfg, &subject, &body) {
+        Ok(()) => info!("improve: návrh #{} odeslán e-mailem", imp.id),
+        Err(e) => warn!("improve: e-mail o návrhu #{} selhal (jen oznámení): {e:#}", imp.id),
+    }
+}
+
+// ---------- self-source (opt-in) ----------
+
+/// Opt-in: mine actionable issues from the current main and queue fix tasks.
+/// v1 = clippy warnings on the repo (cheap, clearly scoped). Dedups within the
+/// run and caps how many it queues; returns the count. Only called when the
+/// queue is empty, so warnings don't pile up run over run.
+fn self_source(cfg: &Config, conn: &rusqlite::Connection) -> i64 {
+    let repo = repo_root(cfg);
+    let out = match run_capture(
+        "cargo",
+        &["clippy", "--quiet", "--message-format", "short"],
+        &repo,
+        &[],
+        Duration::from_secs(1200),
+    ) {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let mut queued = 0;
+    let mut seen = std::collections::HashSet::new();
+    for line in out.stderr.lines().chain(out.stdout.lines()) {
+        let Some(idx) = line.find(": warning: ") else {
+            continue;
+        };
+        let loc = line[..idx].trim();
+        let msg = line[idx + ": warning: ".len()..].trim();
+        if msg.is_empty() || !loc.contains(".rs:") || !seen.insert(loc.to_string()) {
+            continue;
+        }
+        let spec = format!(
+            "Fix this clippy warning without changing behaviour, and keep all tests green:\n\
+             {loc}: {msg}\nTouch only the file involved."
+        );
+        let title = format!("clippy: {}", util::truncate_chars(msg, 56));
+        if db::insert_improvement(conn, util::now_ts(), SRC_CLIPPY, &title, &spec).is_ok() {
+            queued += 1;
+        }
+        if queued >= 3 {
+            break; // cap per run
+        }
+    }
+    queued
+}
+
+// ---------- autonomous tick (timer-driven) ----------
+
+/// One autonomous pass (from the `jarvis-improve` timer): if enabled and under
+/// the daily attempt/budget caps, draft the oldest queued task (self-sourcing
+/// first if the queue is empty and it's allowed), and on green, propose + email.
+/// At most one improvement per tick (stay calm). All errors are just logged —
+/// a timer must never abort. Blocks for the whole codegen; it runs in its own
+/// timer process, not the daemon loop.
+pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<()> {
+    let im = &cfg.improve;
+    if !im.enabled {
+        info!("improve tick: [improve] enabled=false — nic nedělám");
+        return Ok(());
+    }
+    let day_start = util::day_bounds_local(util::today_local()).map(|(s, _)| s).unwrap_or(0);
+    if db::improvement_attempts_since(conn, day_start).unwrap_or(0) >= im.daily_max as i64 {
+        info!("improve tick: denní strop {} pokusů dosažen", im.daily_max);
+        return Ok(());
+    }
+    if improve_spent_today(conn) >= im.daily_budget_usd {
+        info!("improve tick: denní rozpočet {:.2} USD vyčerpán", im.daily_budget_usd);
+        return Ok(());
+    }
+    if im.allow_self_source && db::oldest_queued_improvement(conn)?.is_none() {
+        let n = self_source(cfg, conn);
+        if n > 0 {
+            info!("improve tick: self-source zařadil {n} úkolů");
+        }
+    }
+    let Some(imp) = db::oldest_queued_improvement(conn)? else {
+        info!("improve tick: fronta prázdná — žádná práce");
+        return Ok(());
+    };
+    info!("improve tick: draftuji #{} „{}“", imp.id, imp.title);
+    match draft(paths, cfg, conn, Some(imp.id), false) {
+        Ok(()) => {
+            if let Err(e) = propose(cfg, conn, imp.id) {
+                warn!("improve tick: propose #{} selhal: {e:#}", imp.id);
+            } else if let Ok(Some(p)) = db::improvement_by_id(conn, imp.id) {
+                notify_proposed(paths, cfg, &p);
+            }
+        }
+        Err(e) => info!("improve tick: draft #{} neprošel bránou: {e:#}", imp.id),
+    }
+    Ok(())
 }
 
 /// `jarvis improve tick --dry-run`: config envelope + ledger tally + repo

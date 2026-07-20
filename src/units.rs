@@ -169,6 +169,32 @@ pub fn unit_files(
              WantedBy=timers.target\n"
                 .to_string(),
         ),
+        (
+            "jarvis-improve.service",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — sebe-vývoj (draft → test → propose, oznámení e-mailem)\n\n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 ExecStart={exec} improve tick\n\
+                 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n\
+                 EnvironmentFile=-%h/.config/jarvis/secrets.env\n"
+            ),
+        ),
+        (
+            // night cadence: codegen + cargo builds are slow and paid, so run
+            // while away; enabled only when [improve] enabled=true (ship dark).
+            "jarvis-improve.timer",
+            "[Unit]\n\
+             Description=Jarvis — sebe-vývoj (noční timer)\n\n\
+             [Timer]\n\
+             OnCalendar=*-*-* 03:17:00\n\
+             Persistent=true\n\
+             RandomizedDelaySec=600\n\n\
+             [Install]\n\
+             WantedBy=timers.target\n"
+                .to_string(),
+        ),
     ]
 }
 
@@ -189,6 +215,8 @@ pub fn unit_names() -> Vec<&'static str> {
         "jarvis-memory.timer",
         "jarvis-tasks.service",
         "jarvis-tasks.timer",
+        "jarvis-improve.service",
+        "jarvis-improve.timer",
     ]
 }
 
@@ -243,6 +271,9 @@ pub fn install(cfg: &Config, print_only: bool) -> Result<()> {
     if cfg.tasks.enabled {
         enable.push("jarvis-tasks.timer");
     }
+    if cfg.improve.enabled {
+        enable.push("jarvis-improve.timer");
+    }
     systemctl(&enable)?;
     if !cfg.listen.enabled {
         // listen disabled in config → stop any previously enabled service;
@@ -257,6 +288,9 @@ pub fn install(cfg: &Config, print_only: bool) -> Result<()> {
     }
     if !cfg.tasks.enabled {
         let _ = systemctl(&["disable", "--now", "jarvis-tasks.timer"]);
+    }
+    if !cfg.improve.enabled {
+        let _ = systemctl(&["disable", "--now", "jarvis-improve.timer"]);
     }
     println!("Units aktivní. Kontrola: systemctl --user list-timers 'jarvis-*'");
     Ok(())
@@ -285,7 +319,7 @@ mod tests {
     #[test]
     fn units_contain_essentials() {
         let units = unit_files("/usr/bin/jarvis", ":0.0", Some("/home/u/.Xauthority"), 19, 4);
-        assert_eq!(units.len(), 12);
+        assert_eq!(units.len(), 14);
         let capture = &units[0].1;
         assert!(capture.contains("ExecStart=/usr/bin/jarvis capture"));
         assert!(capture.contains("Environment=DISPLAY=:0.0"));

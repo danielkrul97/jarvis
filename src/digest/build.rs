@@ -20,6 +20,7 @@ pub struct DayData {
     pub runbook_runs: Vec<crate::runbook::RunRow>,
     pub pending_proposals: usize,
     pub task_runs: Vec<crate::tasks::TaskRun>,
+    pub improvements: Vec<db::ImprovementRow>,
     pub cost_usd: f64,
 }
 
@@ -61,6 +62,10 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
     let runbook_runs = crate::runbook::runs_between(conn, from, to)?;
     let pending_proposals = crate::runbook::pending_proposals(conn)?.len();
     let task_runs = crate::tasks::runs_between(conn, from, to)?;
+    let improvements = db::improvements_since(conn, from)?
+        .into_iter()
+        .filter(|i| i.updated_at < to)
+        .collect();
     let cost_usd = db::cost_between(conn, from, to)?;
     Ok(DayData {
         date,
@@ -71,6 +76,7 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
         runbook_runs,
         pending_proposals,
         task_runs,
+        improvements,
         cost_usd,
     })
 }
@@ -207,6 +213,30 @@ pub fn deterministic_markdown(data: &DayData) -> String {
             md.push_str(&format!(
                 "\n{} návrh(y) čekají na schválení — `jarvis runbook pending`.\n",
                 data.pending_proposals
+            ));
+        }
+    }
+
+    if !data.improvements.is_empty() {
+        md.push_str("\n## Sebe-vývoj\n");
+        for i in &data.improvements {
+            let mark = match i.status.as_str() {
+                "merged" | "deployed" => "✓",
+                "proposed" | "tested" | "approved" => "•",
+                "failed" | "rolled_back" | "dismissed" => "✗",
+                _ => "…",
+            };
+            md.push_str(&format!(
+                "- {mark} #{} **{}** — {}\n",
+                i.id,
+                i.status,
+                util::truncate_chars(&i.title, 70)
+            ));
+        }
+        let proposed = data.improvements.iter().filter(|i| i.status == "proposed").count();
+        if proposed > 0 {
+            md.push_str(&format!(
+                "\n{proposed} návrh(y) čekají na schválení u klávesnice — `jarvis improve approve N`.\n"
             ));
         }
     }
@@ -423,6 +453,7 @@ mod tests {
                     output: "odstraněno 3 snímků".into(),
                 },
             ],
+            improvements: vec![],
             cost_usd: 0.05,
         };
         let md = deterministic_markdown(&data);
@@ -454,12 +485,59 @@ mod tests {
             runbook_runs: vec![],
             pending_proposals: 0,
             task_runs: vec![],
+            improvements: vec![],
             cost_usd: 0.0,
         };
         let md = deterministic_markdown(&data);
         assert!(md.contains("# Jarvis digest"));
         assert!(!md.contains("## Automatizace (runbooky)"));
         assert!(!md.contains("## Údržba a závislosti"));
+        assert!(!md.contains("## Sebe-vývoj"), "no improvements → no section");
+    }
+
+    #[test]
+    fn digest_shows_self_improvement_section() {
+        let imp = crate::store::db::ImprovementRow {
+            id: 3,
+            created_at: 100,
+            updated_at: 200,
+            source: "directed".into(),
+            title: "přidej RSS čtečku".into(),
+            spec: "…".into(),
+            branch: "jarvis/improve/3-rss".into(),
+            base_commit: "abc123".into(),
+            head_commit: "def456".into(),
+            status: "proposed".into(),
+            envelope: "feature".into(),
+            diff_stat: "1 file changed".into(),
+            diff_sha256: "deadbeef".into(),
+            tests_passed: Some(true),
+            test_output: String::new(),
+            cost_usd: 1.0,
+            tokens_in: 10,
+            tokens_out: 5,
+            approved_at: None,
+            approved_via: String::new(),
+            merged_at: None,
+            deployed_at: None,
+            note: String::new(),
+        };
+        let data = DayData {
+            date: day(),
+            segments: vec![seg(0, 3600, "vim", "main.rs")],
+            summaries: vec![],
+            degraded_count: 0,
+            patterns: vec![],
+            runbook_runs: vec![],
+            pending_proposals: 0,
+            task_runs: vec![],
+            improvements: vec![imp],
+            cost_usd: 1.0,
+        };
+        let md = deterministic_markdown(&data);
+        assert!(md.contains("## Sebe-vývoj"));
+        assert!(md.contains("přidej RSS čtečku"));
+        assert!(md.contains("jarvis improve approve"), "a proposed change prompts approval");
     }
 
     #[test]
