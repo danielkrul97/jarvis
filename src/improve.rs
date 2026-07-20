@@ -30,12 +30,22 @@
 
 #![allow(dead_code)]
 
-use crate::config::{Config, Paths};
+use crate::config::{Config, ImproveCfg, Paths};
+use crate::pipeline::claude;
 use crate::store::db;
 use crate::util;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tracing::info;
+
+/// Tools handed to the codegen agent inside the worktree: it may read, edit,
+/// write, and build/test — but NOT run git (Jarvis owns every git operation and
+/// the gates) and NOT `cargo add`/`install`/`publish` (deps are gate-critical).
+const DRAFT_TOOLS: &str = "Read,Edit,Write,Bash(cargo build:*),Bash(cargo test:*),\
+    Bash(cargo check:*),Bash(cargo fmt:*),Bash(cargo clippy:*)";
 
 // improvement sources (= improvements.source column)
 pub const SRC_DIRECTED: &str = "directed"; // "Jarvisi, teach yourself X"
@@ -218,7 +228,7 @@ pub enum ImproveCmd {
     },
 }
 
-pub fn cli(_paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: ImproveCmd) -> Result<()> {
+pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: ImproveCmd) -> Result<()> {
     match cmd {
         ImproveCmd::Queue { spec, source } => {
             let spec = spec.join(" ").trim().to_string();
@@ -265,6 +275,8 @@ pub fn cli(_paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Impro
                 r.status
             );
             db::set_improvement_status(conn, id, STATUS_DISMISSED, "ručně zahozeno")?;
+            // drop the isolated worktree; keep the branch for inspection
+            cleanup_worktree(&repo_root(cfg), &worktree_path(paths, id));
             let tail = if r.branch.is_empty() {
                 String::new()
             } else {
@@ -280,8 +292,8 @@ pub fn cli(_paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Impro
                 bail!("automatická smyčka je fáze 5 — zatím spouštěj kroky ručně (draft → test → propose → approve)")
             }
         }
-        ImproveCmd::Draft { .. } => not_yet(2, "draft (větev + codegen + commit)"),
-        ImproveCmd::Test { .. } => not_yet(3, "test (failable brána build+test)"),
+        ImproveCmd::Draft { id, dry_run } => draft(paths, cfg, conn, id, dry_run),
+        ImproveCmd::Test { id } => test_cmd(paths, cfg, conn, id),
         ImproveCmd::Propose { .. } => not_yet(4, "propose (zapíchnutí sha256 + nabídka)"),
         ImproveCmd::Approve { .. } => not_yet(4, "approve + merge (TTY/Telegram)"),
         ImproveCmd::Deploy { .. } => not_yet(6, "deploy (rebuild + smoke + swap + restart)"),
@@ -392,6 +404,436 @@ fn print_improvement(r: &db::ImprovementRow) {
     }
 }
 
+// ---------- subprocess runner (git + cargo) ----------
+
+struct CmdOut {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+/// Drains a child pipe to a String on its own thread (a full pipe must never
+/// deadlock the wait loop). None pipe → empty.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    match pipe {
+        Some(mut p) => {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = p.read_to_string(&mut s);
+                let _ = tx.send(s);
+            });
+        }
+        None => {
+            let _ = tx.send(String::new());
+        }
+    }
+    rx
+}
+
+/// Runs a child in its OWN process group with a hard timeout (SIGKILL to the
+/// whole group — cargo spawns rustc children). Threaded drain, bounded join.
+/// Modeled on `runbook::run_one`.
+fn run_capture(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    envs: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<CmdOut> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().with_context(|| format!("nelze spustit {program}"))?;
+    let out_rx = drain(child.stdout.take());
+    let err_rx = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(_) => {
+                unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+                let _ = child.wait();
+                break None;
+            }
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let grace = Duration::from_secs(5);
+    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+    Ok(CmdOut { code: status.and_then(|s| s.code()), stdout, stderr, timed_out })
+}
+
+// ---------- git plumbing (Jarvis owns every git op) ----------
+
+/// Runs a git command in `dir`, returning stdout; errors carry stderr.
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = run_capture("git", args, dir, &[], Duration::from_secs(120))?;
+    if out.timed_out {
+        bail!("git {} vypršel (120 s)", args.join(" "));
+    }
+    if out.code != Some(0) {
+        bail!(
+            "git {} selhalo (exit {:?}): {}",
+            args.join(" "),
+            out.code,
+            util::truncate_chars(out.stderr.trim(), 500)
+        );
+    }
+    Ok(out.stdout)
+}
+
+fn git_head(repo: &Path, rev: &str) -> Result<String> {
+    Ok(git(repo, &["rev-parse", rev])?.trim().to_string())
+}
+
+fn worktree_is_clean(dir: &Path) -> Result<bool> {
+    Ok(git(dir, &["status", "--porcelain"])?.trim().is_empty())
+}
+
+fn changed_files(worktree: &Path, base: &str) -> Result<Vec<String>> {
+    Ok(git(worktree, &["diff", "--name-only", base, "HEAD"])?
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Counts test attributes in the tree's Rust sources — input to the
+/// test-integrity guard (a shrinking count = tests removed to force green).
+fn count_test_attrs(dir: &Path) -> i64 {
+    let script = "grep -rIhE '#\\[(test|tokio::test)\\]' src 2>/dev/null | wc -l";
+    match run_capture("bash", &["-c", script], dir, &[], Duration::from_secs(60)) {
+        Ok(o) => o.stdout.trim().parse().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Commits all changes in the worktree under Jarvis's machine identity, so
+/// `git log --author=<author_name>` cleanly separates self-authored changes.
+fn commit_all(worktree: &Path, im: &ImproveCfg, msg: &str) -> Result<String> {
+    git(worktree, &["add", "-A"])?;
+    let name = format!("user.name={}", im.author_name);
+    let email = format!("user.email={}", im.author_email);
+    git(worktree, &["-c", name.as_str(), "-c", email.as_str(), "commit", "--no-verify", "-m", msg])?;
+    git_head(worktree, "HEAD")
+}
+
+fn worktree_path(paths: &Paths, id: i64) -> PathBuf {
+    paths.data_dir.join("improve").join(format!("wt-{id}"))
+}
+
+/// Removes the worktree dir and prunes git's registry (branch is kept for
+/// inspection). Best-effort — never fails the caller.
+fn cleanup_worktree(repo: &Path, wt: &Path) {
+    if wt.exists() {
+        let wt_s = wt.to_string_lossy();
+        let _ = git(repo, &["worktree", "remove", "--force", wt_s.as_ref()]);
+        let _ = std::fs::remove_dir_all(wt);
+    }
+    let _ = git(repo, &["worktree", "prune"]);
+}
+
+/// Single-draft lock (flock), same idea as per-runbook locks.
+fn acquire_lock(paths: &Paths) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let path = paths.data_dir.join("improve.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("nelze otevřít {}", path.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("jiný improve běh právě probíhá — nespouštím podruhé");
+    }
+    Ok(f)
+}
+
+// ---------- codegen prompt + result parsing (pure) ----------
+
+/// The instructions handed to the codegen agent. Bakes in the house rules
+/// (English comments), the test-integrity constraint, gate-file caution, and a
+/// strict JSON result contract.
+fn build_draft_prompt(spec: &str, title: &str) -> String {
+    format!(
+        "You are Jarvis working on your OWN source code — a Rust project (an X11 \
+watcher + voice assistant). You are on a fresh, isolated git branch; make the \
+change described below, safely and completely.\n\n\
+TASK: {spec}\n\n\
+HOUSE RULES (from CLAUDE.md):\n\
+- Write all code comments in English; be brief — explain WHY, not what the code \
+obviously does. User-facing Czech strings stay Czech (they are data).\n\
+- Match the surrounding code's style, naming, and idioms.\n\n\
+REQUIREMENTS:\n\
+- Keep the change MINIMAL and focused on the task; do not refactor unrelated code.\n\
+- Add or extend unit tests for the change, then run `cargo test` until green.\n\
+- NEVER weaken, delete, or #[ignore] existing tests to make things pass. The total \
+test count must not go down — that is checked and will reject your work.\n\
+- Reuse existing patterns/helpers (util::, the config/db conventions) over new \
+dependencies. Do NOT add crates (`cargo add` is unavailable).\n\
+- Be cautious around gate/safety files (config.rs defaults, runbook.rs, improve.rs, \
+units.rs, main.rs, telegram.rs). Touch them only if the task truly requires it, and \
+say so in your summary if you do.\n\
+- You have Read/Edit/Write and cargo (build/test/check/fmt/clippy). You do NOT have \
+git — do not attempt commits; committing is handled for you.\n\n\
+WHEN DONE, output ONE JSON object and nothing after it:\n\
+{{\"summary\": \"one line: what you changed\", \"files_changed\": [\"src/...\"], \
+\"tests_added\": <int>, \"touched_gate_files\": <bool>}}\n\n\
+Title: {title}"
+    )
+}
+
+#[derive(Debug, Default)]
+struct DraftResult {
+    summary: String,
+    files_changed: Vec<String>,
+    tests_added: i64,
+    touched_gate_files: bool,
+}
+
+/// Best-effort parse of the agent's JSON result (context only — Jarvis computes
+/// the authoritative diff/envelope from git regardless).
+fn parse_draft_result(text: &str) -> Option<DraftResult> {
+    let json = claude::extract_json(text).ok()?;
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(DraftResult {
+        summary: v["summary"].as_str().unwrap_or_default().to_string(),
+        files_changed: v["files_changed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        tests_added: v["tests_added"].as_i64().unwrap_or(0),
+        touched_gate_files: v["touched_gate_files"].as_bool().unwrap_or(false),
+    })
+}
+
+fn draft_commit_message(id: i64, title: &str, result: Option<&DraftResult>) -> String {
+    let body = result
+        .map(|r| r.summary.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Automated self-improvement drafted by Jarvis.");
+    format!("{}\n\n{}\n\nJarvis-Improvement: {}\n", util::truncate_chars(title, 72), body, id)
+}
+
+/// Parses `cargo test` output: (all suites ok?, total tests that ran). Handles
+/// multiple `test result:` lines (unit + integration + doctests). None if no
+/// summary line is present (e.g. a build failure before any test ran).
+fn parse_test_summary(output: &str) -> Option<(bool, i64)> {
+    let mut seen = false;
+    let mut ok = true;
+    let mut total = 0i64;
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("test result:") else {
+            continue;
+        };
+        seen = true;
+        let rest = rest.trim_start();
+        if !rest.starts_with("ok") {
+            ok = false;
+        }
+        // "... ok. 269 passed; 0 failed; ..." → number right before "passed"
+        if let Some(before) = rest.split("passed").next() {
+            if let Some(n) = before.split_whitespace().last().and_then(|t| t.parse::<i64>().ok()) {
+                total += n;
+            }
+        }
+    }
+    seen.then_some((ok, total))
+}
+
+// ---------- gate + draft/test commands (shell) ----------
+
+struct GateOutcome {
+    passed: bool,
+    output: String,
+}
+
+/// Failable gate: `cargo test` on the worktree. Shares the main repo's target
+/// dir so the compile is incremental (warm cache), not a cold CUDA rebuild.
+fn run_gate(worktree: &Path, repo: &Path, im: &ImproveCfg) -> Result<GateOutcome> {
+    let target = repo.join("target");
+    let target_s = target.to_string_lossy();
+    let envs = [("CARGO_TARGET_DIR", target_s.as_ref())];
+    let timeout = Duration::from_secs(im.timeout_s.max(600));
+    info!("improve: cargo test na větvi ({})", worktree.display());
+    let test = run_capture("cargo", &["test", "--quiet"], worktree, &envs, timeout)?;
+    let combined = format!("{}\n{}", test.stdout, test.stderr);
+    let passed = !test.timed_out && test.code == Some(0);
+    let mut output = util::truncate_chars(combined.trim(), 6000);
+    if test.timed_out {
+        output.push_str(&format!("\n[jarvis] cargo test zabit po {} s", timeout.as_secs()));
+    }
+    Ok(GateOutcome { passed, output })
+}
+
+/// `jarvis improve draft [id] [--dry-run]`: branch off committed main, run
+/// codegen in an isolated worktree, commit under the machine identity, then run
+/// the integrity + build/test gate. Ship-dark: the live path needs `enabled`.
+fn draft(
+    paths: &Paths,
+    cfg: &Config,
+    conn: &rusqlite::Connection,
+    id: Option<i64>,
+    dry_run: bool,
+) -> Result<()> {
+    let im = &cfg.improve;
+    let imp = match id {
+        Some(i) => db::improvement_by_id(conn, i)?.with_context(|| format!("vylepšení #{i} neexistuje"))?,
+        None => db::oldest_queued_improvement(conn)?
+            .context("žádné queued vylepšení; zadej: jarvis improve queue \"…\"")?,
+    };
+    let repo = repo_root(cfg);
+    let branch = branch_name(&im.branch_prefix, imp.id, &imp.title);
+    let wt = worktree_path(paths, imp.id);
+    let prompt = build_draft_prompt(&imp.spec, &imp.title);
+
+    if dry_run {
+        println!("── improve draft #{} (dry-run — nic se nespustí) ──", imp.id);
+        println!("stav:      {}", imp.status);
+        println!("repo:      {} {}", repo.display(), if repo.join(".git").exists() { "(git ✓)" } else { "(⚠ není git)" });
+        println!("větev:     {branch}");
+        println!("worktree:  {}", wt.display());
+        println!("model:     {}", if im.model.is_empty() { "<default CLI>" } else { &im.model });
+        println!("nástroje:  {DRAFT_TOOLS}");
+        println!("max_turns: {} | timeout: {}s | enabled: {}", im.max_turns, im.timeout_s, im.enabled);
+        println!("\n── prompt pro codegen ──\n{prompt}");
+        return Ok(());
+    }
+
+    ensure!(
+        im.enabled,
+        "[improve] enabled=false — ostrý draft je vypnutý (ship-dark). Náhled: jarvis improve draft {} --dry-run",
+        imp.id
+    );
+    ensure!(
+        matches!(imp.status.as_str(), STATUS_QUEUED | STATUS_FAILED),
+        "vylepšení #{} je ve stavu '{}' — draft dělá jen 'queued'/'failed'",
+        imp.id,
+        imp.status
+    );
+    ensure!(repo.join(".git").exists(), "repo {} nemá .git — nastav [improve] repo_dir", repo.display());
+    let base = git_head(&repo, "main").context("v repu není větev 'main' (nebo git selhal)")?;
+
+    let _lock = acquire_lock(paths)?;
+    // fresh worktree at COMMITTED main HEAD — never the dirty live tree
+    cleanup_worktree(&repo, &wt);
+    let _ = git(&repo, &["branch", "-D", &branch]); // clear a stale branch from a prior failed draft
+    if let Some(parent) = wt.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("nelze vytvořit {}", parent.display()))?;
+    }
+    db::set_improvement_status(conn, imp.id, STATUS_DRAFTING, "codegen běží")?;
+    let wt_arg = wt.to_str().context("cesta worktree není UTF-8")?;
+    git(&repo, &["worktree", "add", "-b", &branch, wt_arg, &base])
+        .with_context(|| format!("worktree add selhalo pro větev {branch}"))?;
+
+    let base_tests = count_test_attrs(&wt);
+    info!("improve #{}: codegen na {branch} (base {base_tests} testů, {})", imp.id, &base[..12.min(base.len())]);
+
+    let outcome = match claude::run(&claude::ClaudeRequest {
+        prompt,
+        model: if im.model.is_empty() { None } else { Some(im.model.as_str()) },
+        cwd: &wt,
+        allowed_tools: DRAFT_TOOLS,
+        max_turns: im.max_turns,
+        timeout: Duration::from_secs(im.timeout_s),
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            db::update_improvement_tests(conn, imp.id, None, &util::truncate_chars(&format!("{e:#}"), 2000), STATUS_FAILED)?;
+            cleanup_worktree(&repo, &wt);
+            return Err(e).context("codegen selhal");
+        }
+    };
+    db::add_improvement_cost(conn, imp.id, outcome.cost_usd, outcome.tokens_in, outcome.tokens_out)?;
+    let result = parse_draft_result(&outcome.text);
+
+    if worktree_is_clean(&wt)? {
+        db::update_improvement_tests(conn, imp.id, None, "agent neprovedl žádnou změnu", STATUS_FAILED)?;
+        cleanup_worktree(&repo, &wt);
+        bail!("codegen neprovedl žádnou změnu (#{} → failed)", imp.id);
+    }
+
+    let msg = draft_commit_message(imp.id, &imp.title, result.as_ref());
+    let head = commit_all(&wt, im, &msg)?;
+    let files = changed_files(&wt, &base)?;
+    let envelope = classify_envelope(&files);
+    let diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
+    db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
+    let head_short = &head[..12.min(head.len())];
+    info!("improve #{}: commit {head_short} ({} souborů, obálka {envelope})", imp.id, files.len());
+
+    // integrity guard: the suite must not shrink
+    let head_tests = count_test_attrs(&wt);
+    if !test_integrity_ok(base_tests, head_tests) {
+        let note = format!("test-integrity FAIL: base {base_tests} → head {head_tests} (testy nesmí ubývat)");
+        db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
+        bail!("#{}: {note} — zamítnuto (větev {branch} zůstává k inspekci)", imp.id);
+    }
+
+    // failable gate: build + test
+    let gate = run_gate(&wt, &repo, im)?;
+    let status = if gate.passed { STATUS_TESTED } else { STATUS_FAILED };
+    db::update_improvement_tests(conn, imp.id, Some(gate.passed), &gate.output, status)?;
+
+    println!("── improve draft #{} ──", imp.id);
+    println!("větev:   {branch}");
+    println!("commit:  {head_short}");
+    println!("obálka:  {envelope}");
+    println!("diff:    {diff_stat}");
+    println!("testy:   base {base_tests} → head {head_tests}; brána {}", if gate.passed { "✓ ZELENÁ" } else { "✗ ČERVENÁ" });
+    if let Some(r) = &result {
+        if !r.summary.is_empty() {
+            println!("shrnutí: {}", util::truncate_chars(&r.summary, 200));
+        }
+    }
+    println!("náklad:  {:.4} USD", outcome.cost_usd);
+    if gate.passed {
+        println!("\n✓ připraveno: jarvis improve show {} → (fáze 4) propose/approve", imp.id);
+    } else {
+        println!("\n✗ brána červená → failed. Log: jarvis improve show {}", imp.id);
+        bail!("brána červená");
+    }
+    Ok(())
+}
+
+/// `jarvis improve test <id>`: re-run the failable gate on an already-drafted
+/// branch's worktree.
+fn test_cmd(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64) -> Result<()> {
+    let imp = db::improvement_by_id(conn, id)?.with_context(|| format!("vylepšení #{id} neexistuje"))?;
+    ensure!(!imp.branch.is_empty(), "vylepšení #{id} ještě nebylo draftnuto (žádná větev)");
+    let repo = repo_root(cfg);
+    let wt = worktree_path(paths, id);
+    ensure!(wt.exists(), "worktree #{id} chybí ({}) — nejdřív `jarvis improve draft {id}`", wt.display());
+    let _lock = acquire_lock(paths)?;
+    let gate = run_gate(&wt, &repo, &cfg.improve)?;
+    let status = if gate.passed { STATUS_TESTED } else { STATUS_FAILED };
+    db::update_improvement_tests(conn, id, Some(gate.passed), &gate.output, status)?;
+    println!("testy #{id} ({}): brána {}", imp.branch, if gate.passed { "✓ ZELENÁ" } else { "✗ ČERVENÁ" });
+    if !gate.passed {
+        bail!("brána červená — log: jarvis improve show {id}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +917,55 @@ mod tests {
     fn title_from_spec_takes_first_line() {
         assert_eq!(title_from_spec("Přidej RSS\ndruhý řádek"), "Přidej RSS");
         assert_eq!(title_from_spec("  oříznu okraje  "), "oříznu okraje");
+    }
+
+    #[test]
+    fn parse_test_summary_sums_and_detects_failure() {
+        let ok = "running 3 tests\n\
+                  test result: ok. 269 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 21s\n\
+                  Doc-tests jarvis\n\
+                  test result: ok. 2 passed; 0 failed; 0 ignored";
+        assert_eq!(parse_test_summary(ok), Some((true, 271)));
+        let bad = "test result: FAILED. 267 passed; 2 failed; 1 ignored; 0 measured";
+        assert_eq!(parse_test_summary(bad), Some((false, 267)));
+        // mixed suites: overall false, counts still sum
+        let mixed = "test result: ok. 10 passed; 0 failed\ntest result: FAILED. 5 passed; 1 failed";
+        assert_eq!(parse_test_summary(mixed), Some((false, 15)));
+        // a build failure has no summary line at all
+        assert_eq!(parse_test_summary("error[E0432]: unresolved import\nerror: could not compile"), None);
+    }
+
+    #[test]
+    fn parse_draft_result_reads_json_with_fences() {
+        let text = "Hotovo.\n```json\n{\"summary\":\"add RSS reader\",\"files_changed\":[\"src/rss.rs\"],\"tests_added\":3,\"touched_gate_files\":false}\n```";
+        let r = parse_draft_result(text).unwrap();
+        assert_eq!(r.summary, "add RSS reader");
+        assert_eq!(r.files_changed, vec!["src/rss.rs".to_string()]);
+        assert_eq!(r.tests_added, 3);
+        assert!(!r.touched_gate_files);
+        assert!(parse_draft_result("žádný json").is_none());
+    }
+
+    #[test]
+    fn draft_prompt_carries_the_guardrails() {
+        let p = build_draft_prompt("add an RSS reader", "RSS");
+        assert!(p.contains("add an RSS reader"), "the task");
+        assert!(p.contains("test count must not go down"), "integrity constraint");
+        assert!(p.contains("do NOT have"), "no-git constraint");
+        assert!(p.contains("JSON"), "result contract");
+        assert!(p.contains("English"), "house rules");
+    }
+
+    #[test]
+    fn commit_message_has_improvement_trailer() {
+        let r = DraftResult { summary: "add RSS".into(), ..Default::default() };
+        let m = draft_commit_message(7, "Add RSS reader", Some(&r));
+        assert!(m.starts_with("Add RSS reader\n"));
+        assert!(m.contains("add RSS"));
+        assert!(m.contains("Jarvis-Improvement: 7"));
+        // no agent result → default body, trailer still present
+        let m2 = draft_commit_message(9, "Title", None);
+        assert!(m2.contains("Automated self-improvement"));
+        assert!(m2.contains("Jarvis-Improvement: 9"));
     }
 }

@@ -655,6 +655,62 @@ pub fn set_improvement_status(conn: &Connection, id: i64, status: &str, note: &s
     Ok(())
 }
 
+/// Records draft results: branch, base/head commits, envelope, diff stat, status.
+#[allow(clippy::too_many_arguments)]
+pub fn update_improvement_draft(
+    conn: &Connection,
+    id: i64,
+    branch: &str,
+    base_commit: &str,
+    head_commit: &str,
+    envelope: &str,
+    diff_stat: &str,
+    status: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE improvements SET branch=?2, base_commit=?3, head_commit=?4, envelope=?5,
+           diff_stat=?6, status=?7, updated_at=?8 WHERE id=?1",
+        params![id, branch, base_commit, head_commit, envelope, diff_stat, status, crate::util::now_ts()],
+    )?;
+    Ok(())
+}
+
+/// Records the build+test gate outcome and the resulting terminal status.
+pub fn update_improvement_tests(
+    conn: &Connection,
+    id: i64,
+    passed: Option<bool>,
+    output: &str,
+    status: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE improvements SET tests_passed=?2, test_output=?3, status=?4, updated_at=?5 WHERE id=?1",
+        params![id, passed.map(i64::from), output, status, crate::util::now_ts()],
+    )?;
+    Ok(())
+}
+
+/// Accumulates codegen spend into the row (a draft may take several attempts).
+pub fn add_improvement_cost(conn: &Connection, id: i64, cost: f64, tin: i64, tout: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE improvements SET cost_usd=cost_usd+?2, tokens_in=tokens_in+?3,
+           tokens_out=tokens_out+?4, updated_at=?5 WHERE id=?1",
+        params![id, cost, tin, tout, crate::util::now_ts()],
+    )?;
+    Ok(())
+}
+
+/// Oldest improvement still waiting to be drafted (queued), if any.
+pub fn oldest_queued_improvement(conn: &Connection) -> Result<Option<ImprovementRow>> {
+    conn.query_row(
+        &format!("SELECT {IMPR_COLS} FROM improvements WHERE status='queued' ORDER BY id ASC LIMIT 1"),
+        [],
+        improvement_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// The last `limit` nudges (listing in `status`).
 pub fn recent_nudges(conn: &Connection, limit: usize) -> Result<Vec<NudgeRow>> {
     let mut stmt =
