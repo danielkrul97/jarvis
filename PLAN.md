@@ -799,6 +799,19 @@ Konfigurace `[improve]` (vzor v `config.example.toml`), ship-dark
   musí instalovat do `~/.cargo/bin` a teprve pak `install-units`.
   `enabled`/`deploy_enabled` zůstávají `false` do ověření.
 
-Resume: `src/improve.rs` má dočasný `#![allow(dead_code)]` scaffold (odstranit
-po fázi 6, až shell spotřebuje všechny čisté funkce). Další krok: **fáze 2 —
-`git()` helper + `draft`**.
+**Ověřeno naživo (2026-07-20):** ostrý end-to-end draft na reálném úkolu
+(`util::mask_secret`) — Claude napsal korektní, otestovaný Rust (char-based,
+multibyte-safe, dobrý anglický komentář + test na dlouhý/8-znaků/prázdný/
+multibyte vstup), Jarvis commitnul pod strojovou identitou, integrity 276→277,
+brána `cargo test` **zeleno**, `propose` zapíchl otisk; reálný main NEDOTČEN,
+artefakty uklizeny. Náklad **$1,08 / malý úkol** (nejsilnější model, ~5 min).
+Pozn.: izolovaný HOME v testu odřízl rustup default toolchain i claude creds
+(obojí žije pod reálným HOME → řešeno `RUSTUP_HOME`/`CARGO_HOME` + kopií creds);
+v produkci (démon pod reálným HOME) tenhle artefakt nevzniká. Zbytkový gap:
+neviděl jsem agentovu self-repair smyčku (v testu neměl funkční cargo, kód dal
+správně napoprvé).
+
+Resume: `src/improve.rs` má dočasný `#![allow(dead_code)]` scaffold (pryč po
+fázi 6). Hotovo: **fáze 1, 2, 3-jádro, 4 + live e2e**. Zbývá: fáze 3-rest
+(self-repair smyčka), **fáze 5** (`tick` + Telegram approve + digest sekce),
+**fáze 6** (self-deploy: rebuild + smoke + swap + rollback + restart).

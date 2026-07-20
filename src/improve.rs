@@ -760,6 +760,12 @@ fn draft(
     let base_tests = count_test_attrs(&wt);
     info!("improve #{}: codegen na {branch} (base {base_tests} testů, {})", imp.id, &base[..12.min(base.len())]);
 
+    // The codegen agent runs cargo during its edit→test loop; point it at the
+    // main repo's warm target dir so those builds are incremental, not a cold
+    // CUDA rebuild per turn. (This CLI command is a one-shot process, so a
+    // process-wide env var is fine; the gate sets the same dir explicitly.)
+    std::env::set_var("CARGO_TARGET_DIR", repo.join("target"));
+
     let outcome = match claude::run(&claude::ClaudeRequest {
         prompt,
         model: if im.model.is_empty() { None } else { Some(im.model.as_str()) },
