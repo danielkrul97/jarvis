@@ -1365,12 +1365,20 @@ fn smoke_test(bin: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Is the core daemon active after a restart? (capture is always enabled.)
-fn capture_active() -> bool {
-    matches!(
-        run_capture("systemctl", &["--user", "is-active", "jarvis-capture.service"], &std::env::temp_dir(), &[], Duration::from_secs(15)),
-        Ok(o) if o.stdout.trim() == "active"
-    )
+/// After a restart, are the daemons that should be running actually active?
+/// Checks capture (always on) and listen (if enabled). A crash-on-boot from a
+/// bad deploy shows up here → rollback.
+fn daemons_healthy(cfg: &Config) -> bool {
+    let mut svcs = vec!["jarvis-capture.service"];
+    if cfg.listen.enabled {
+        svcs.push("jarvis-listen.service");
+    }
+    svcs.iter().all(|svc| {
+        matches!(
+            run_capture("systemctl", &["--user", "is-active", svc], &std::env::temp_dir(), &[], Duration::from_secs(15)),
+            Ok(o) if o.stdout.trim() == "active"
+        )
+    })
 }
 
 fn notify_deploy(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow, ok: bool, detail: &str) {
@@ -1451,8 +1459,10 @@ fn deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64, dry
         Duration::from_secs(60),
     );
 
-    // 5. health check; roll back if the daemon didn't come up
-    if !capture_active() {
+    // 5. let services settle, then health-check; roll back if a daemon didn't
+    // come up on the new binary
+    std::thread::sleep(Duration::from_secs(4));
+    if !daemons_healthy(cfg) {
         if prev.exists() {
             let _ = std::fs::copy(&prev, &bin);
         }
