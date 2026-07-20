@@ -711,6 +711,36 @@ pub fn oldest_queued_improvement(conn: &Connection) -> Result<Option<Improvement
     .map_err(Into::into)
 }
 
+/// Pins the diff hash + envelope at proposal time (the TOCTOU baseline verified
+/// before merge). status → proposed.
+pub fn set_improvement_proposed(conn: &Connection, id: i64, diff_sha256: &str, envelope: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE improvements SET status='proposed', diff_sha256=?2, envelope=?3, updated_at=?4 WHERE id=?1",
+        params![id, diff_sha256, envelope, crate::util::now_ts()],
+    )?;
+    Ok(())
+}
+
+/// Records human approval (status → approved) with the channel (cli | telegram).
+pub fn set_improvement_approved(conn: &Connection, id: i64, via: &str) -> Result<()> {
+    let now = crate::util::now_ts();
+    conn.execute(
+        "UPDATE improvements SET status='approved', approved_at=?2, approved_via=?3, updated_at=?2 WHERE id=?1",
+        params![id, now, via],
+    )?;
+    Ok(())
+}
+
+/// Records the merge into main (status → merged).
+pub fn set_improvement_merged(conn: &Connection, id: i64) -> Result<()> {
+    let now = crate::util::now_ts();
+    conn.execute(
+        "UPDATE improvements SET status='merged', merged_at=?2, updated_at=?2 WHERE id=?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
 /// The last `limit` nudges (listing in `status`).
 pub fn recent_nudges(conn: &Connection, limit: usize) -> Result<Vec<NudgeRow>> {
     let mut stmt =

@@ -264,6 +264,18 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
             let r = db::improvement_by_id(conn, id)?
                 .with_context(|| format!("vylepšení #{id} neexistuje"))?;
             print_improvement(&r);
+            // once drafted, show the diffstat against the base (review aid)
+            if !r.base_commit.is_empty() && !r.head_commit.is_empty() {
+                if let Ok(stat) = git(&repo_root(cfg), &["diff", "--stat", &r.base_commit, &r.head_commit]) {
+                    let stat = stat.trim();
+                    if !stat.is_empty() {
+                        println!("  ── diff --stat (base → head) ──");
+                        for line in stat.lines() {
+                            println!("  {line}");
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         ImproveCmd::Dismiss { id } => {
@@ -294,8 +306,8 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
         }
         ImproveCmd::Draft { id, dry_run } => draft(paths, cfg, conn, id, dry_run),
         ImproveCmd::Test { id } => test_cmd(paths, cfg, conn, id),
-        ImproveCmd::Propose { .. } => not_yet(4, "propose (zapíchnutí sha256 + nabídka)"),
-        ImproveCmd::Approve { .. } => not_yet(4, "approve + merge (TTY/Telegram)"),
+        ImproveCmd::Propose { id } => propose(cfg, conn, id),
+        ImproveCmd::Approve { id } => approve(paths, cfg, conn, id),
         ImproveCmd::Deploy { .. } => not_yet(6, "deploy (rebuild + smoke + swap + restart)"),
     }
 }
@@ -834,6 +846,107 @@ fn test_cmd(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64) -
     Ok(())
 }
 
+// ---------- propose / approve / merge (phase 4) ----------
+
+/// First 12 chars of a sha (display), safe for short strings.
+fn short(sha: &str) -> &str {
+    &sha[..12.min(sha.len())]
+}
+
+/// `jarvis improve propose <id>`: pin the green change's diff hash and offer it
+/// for approval. Operates on the stored base/head commits — no worktree needed.
+fn propose(cfg: &Config, conn: &rusqlite::Connection, id: i64) -> Result<()> {
+    let imp = db::improvement_by_id(conn, id)?.with_context(|| format!("vylepšení #{id} neexistuje"))?;
+    ensure!(imp.status == STATUS_TESTED, "navrhnout jde jen otestované (tested) — #{id} je '{}'", imp.status);
+    ensure!(imp.tests_passed == Some(true), "#{id} nemá zelené testy — nejdřív projdi bránou");
+    ensure!(
+        !imp.base_commit.is_empty() && !imp.head_commit.is_empty(),
+        "#{id} nemá commity (draft neproběhl?)"
+    );
+    let repo = repo_root(cfg);
+    let diff = git(&repo, &["diff", &imp.base_commit, &imp.head_commit])?;
+    ensure!(!diff.trim().is_empty(), "prázdný diff — nic k nabídnutí (#{id})");
+    let sha = util::sha256_hex(diff.as_bytes());
+    let files: Vec<String> = git(&repo, &["diff", "--name-only", &imp.base_commit, &imp.head_commit])?
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let envelope = classify_envelope(&files);
+    db::set_improvement_proposed(conn, id, &sha, envelope)?;
+    println!("── návrh #{id}: {} ──", imp.title);
+    println!("větev:    {}", imp.branch);
+    let warn = if envelope == ENV_GATE_CRITICAL {
+        "  ⚠ sahá na bezpečnostní/gate soubory — nutná pečlivá revize"
+    } else {
+        ""
+    };
+    println!("obálka:   {envelope}{warn}");
+    println!("diff:     {}", imp.diff_stat);
+    println!("otisk:    {}… (zapíchnuto; před merge se ověří)", short(&sha));
+    println!("revize:   git -C {} diff {} {}", repo.display(), short(&imp.base_commit), short(&imp.head_commit));
+    println!("schválit: jarvis improve approve {id}   (u klávesnice — opíšeš číslo)");
+    Ok(())
+}
+
+/// `jarvis improve approve <id>`: the human gate. Re-verifies no drift, the
+/// pinned diff hash (TOCTOU), and a clean main tree, requires a typed-token
+/// confirmation, then fast-forwards main to the Jarvis-authored commit.
+fn approve(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64) -> Result<()> {
+    let imp = db::improvement_by_id(conn, id)?.with_context(|| format!("vylepšení #{id} neexistuje"))?;
+    ensure!(imp.status == STATUS_PROPOSED, "schválit jde jen navržené (proposed) — #{id} je '{}'", imp.status);
+    ensure!(imp.tests_passed == Some(true), "#{id} nemá zelené testy");
+    let repo = repo_root(cfg);
+    ensure!(repo.join(".git").exists(), "repo {} nemá .git", repo.display());
+    // no drift: main must still be exactly where the branch was cut from
+    let main_head = git_head(&repo, "main")?;
+    ensure!(
+        main_head == imp.base_commit,
+        "main se pohnul od návrhu (base {} → nyní {}) — #{id} je potřeba re-draftnout",
+        short(&imp.base_commit),
+        short(&main_head)
+    );
+    // TOCTOU: the diff must still hash to the pinned value
+    let diff = git(&repo, &["diff", &imp.base_commit, &imp.head_commit])?;
+    let sha = util::sha256_hex(diff.as_bytes());
+    ensure!(
+        sha == imp.diff_sha256,
+        "diff #{id} se od návrhu ZMĚNIL (otisk nesedí) — z bezpečnosti NEMERGUJI"
+    );
+    // never merge over uncommitted work in the live tree
+    ensure!(
+        worktree_is_clean(&repo)?,
+        "main má necommitnuté změny — ukliď/commitni je před merge #{id}"
+    );
+
+    if imp.envelope == ENV_GATE_CRITICAL {
+        println!("⚠⚠ #{id} sahá na BEZPEČNOSTNÍ/GATE soubory. Zkontroluj diff:");
+        println!("   git -C {} diff {} {}", repo.display(), short(&imp.base_commit), short(&imp.head_commit));
+    }
+    crate::runbook::confirm_at_keyboard(
+        &format!("Schválit a MERGNOUT vylepšení #{id} do main? Opiš číslo pro potvrzení: "),
+        &id.to_string(),
+    )?;
+    db::set_improvement_approved(conn, id, "cli")?;
+
+    // fast-forward: the branch is main + the improvement commit, so main advances
+    // to the Jarvis-authored commit with no merge commit and no tree churn
+    git(&repo, &["merge", "--ff-only", &imp.branch])
+        .with_context(|| format!("merge --ff-only {} selhal — #{id} zůstává approved, řeš ručně", imp.branch))?;
+    db::set_improvement_merged(conn, id)?;
+    cleanup_worktree(&repo, &worktree_path(paths, id));
+    let _ = git(&repo, &["branch", "-d", &imp.branch]);
+    let new_head = git_head(&repo, "main").unwrap_or_default();
+    println!("✓ #{id} smergnuto do main (HEAD {})", short(&new_head));
+    println!("  commit autor: {} <{}>", cfg.improve.author_name, cfg.improve.author_email);
+    if cfg.improve.deploy_enabled {
+        println!("  nasazení: jarvis improve deploy {id}  (fáze 6: rebuild + smoke + restart)");
+    } else {
+        println!("  nasazení ručně: cargo install --path . --force  (deploy_enabled=false)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,5 +1080,52 @@ mod tests {
         let m2 = draft_commit_message(9, "Title", None);
         assert!(m2.contains("Automated self-improvement"));
         assert!(m2.contains("Jarvis-Improvement: 9"));
+    }
+
+    #[test]
+    fn short_sha_is_safe() {
+        assert_eq!(short("6c03c741fdf6abaf"), "6c03c741fdf6");
+        assert_eq!(short("abc"), "abc"); // shorter than 12 → whole string
+        assert_eq!(short(""), "");
+    }
+
+    /// Hermetic end-to-end check of the phase-4 git mechanics: `git()` runner,
+    /// machine-identity commit, diff-hash pinning (TOCTOU baseline), and the
+    /// fast-forward merge — in a throwaway repo, no spend, no TTY. Skips cleanly
+    /// if `git` is unavailable.
+    #[test]
+    fn git_diff_pin_and_ff_merge_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("jarvis-impr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if git(&dir, &["init", "-q", "-b", "main"]).is_err() {
+            return; // no git in this environment → skip
+        }
+        let g = |args: &[&str]| git(&dir, args).unwrap();
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "init"]);
+        let base = git_head(&dir, "main").unwrap();
+
+        // branch + a machine-identity commit
+        g(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        g(&["-c", "user.name=Jarvis", "-c", "user.email=jarvis@localhost", "commit", "-qaam", "change"]);
+        let head = git_head(&dir, "feat").unwrap();
+        assert_ne!(base, head);
+        assert!(g(&["log", "-1", "--format=%an <%ae>"]).contains("Jarvis <jarvis@localhost>"));
+
+        // pin the diff, confirm it is stable
+        let pin = crate::util::sha256_hex(g(&["diff", &base, &head]).as_bytes());
+        assert_eq!(pin, crate::util::sha256_hex(g(&["diff", &base, &head]).as_bytes()));
+
+        // no drift → fast-forward main to the change
+        g(&["checkout", "-q", "main"]);
+        g(&["merge", "--ff-only", "feat"]);
+        assert_eq!(git_head(&dir, "main").unwrap(), head, "main fast-forwarded");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

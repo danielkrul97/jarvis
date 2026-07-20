@@ -770,20 +770,26 @@ Konfigurace `[improve]` (vzor v `config.example.toml`), ship-dark
   ke sdílení. Ověření: `cargo test` **269 zelených** (+9 nových); ostrý
   read-back binárky proti IZOLOVANÉ DB (queue→list→show→dismiss→dry-run,
   `user_version=13`). Ship dark — nic se nespustí.
-- **Fáze 2 — draft engine:** `git()` helper (vzor `units.rs::systemctl`, git
-  v kódu zatím není nikde), větvení z main, codegen přes `claude::run`
-  (cwd=repo, scoped tools), commit pod strojovou identitou + trailerem.
-  Failable check: git plumbing deterministicky (větev+commit+diff+
-  `git log --author=Jarvis`) + `draft --dry-run` (prompt + args, 0 side
-  effects). **První ostrý (placený) codegen spouštíš ty** — `enabled=false`,
-  stejná logika jako ElevenLabs kvóta / SMS geo-permissions: finální ostré
-  ověření zůstává na tobě.
-- **Fáze 3 — failable brána:** build+test na větvi, test-integrity guard,
-  omezená self-repair (`repair_attempts`). Check: zelená projde, rozbitá
-  zamítne, oslabení testů se chytne.
-- **Fáze 4 — propose→approve→merge:** pin sha256, `confirm_at_keyboard` /
-  Telegram číslo, TOCTOU re-verifikace + `base_commit==HEAD`, merge s trailerem.
-  Check: read-back `git log` merge commitu; tamper → refuse (jako runbook test).
+- **Fáze 2 — draft engine: HOTOVO a ověřeno.** `run_capture` (proces-group
+  SIGKILL timeout jako `run_one`) + `git()` helper, izolovaný `git worktree`
+  z committed main (NIKDY dirty tree), codegen `claude::run` (cwd=worktree,
+  tools Read/Edit/Write/cargo — bez git), commit pod strojovou identitou +
+  trailer, `draft --dry-run`, `test <id>`, flock proti souběhu. Ověřeno: 275
+  testů + hermetický git-roundtrip test + ostrý git-worktree smoke (izolace od
+  dirty tree, machine-identity commit). **První ostrý (placený) codegen
+  spouštíš ty** (`enabled=false`).
+- **Fáze 3 — failable brána: JÁDRO HOTOVO.** `cargo test` na větvi (sdílený
+  target = teplý cache) + test-integrity guard (počet testů nesmí klesnout) +
+  envelope klasifikace. Zbývá: omezená self-repair smyčka (retry při červené do
+  `repair_attempts`) + jemnější assertion-level integrita.
+- **Fáze 4 — propose→approve→merge: HOTOVO a ověřeno.** `propose` zapíchne
+  sha256 diffu + klasifikuje obálku; `approve` re-verifikuje no-drift
+  (base==main HEAD) + TOCTOU (otisk diffu) + čistý main tree, pak
+  `confirm_at_keyboard` (TTY-token) → `merge --ff-only` (Jarvisův commit přistane
+  na main) → cleanup worktree+větve. Ověřeno ostře proti reálnému repu (bez
+  útraty, bez TTY): propose pin + VŠECHNY brány zamítly (dirty-tree, TOCTOU
+  tamper, drift tamper, status), main HEAD nedotčen. Telegram approve (číslo
+  z ověřeného chatu) je součást fáze 5.
 - **Fáze 5 — reporting + plán:** sekce „Sebe-vývoj" v digestu (u `build.rs:189`),
   `improve tick` (≤1 akce/tik, jako nudge), volitelný `jarvis-improve.timer`.
 - **Fáze 6 — self-deploy:** `cargo install` → smoke (`--version`/`doctor`/
