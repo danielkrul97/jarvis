@@ -638,6 +638,28 @@ fn parse_draft_result(text: &str) -> Option<DraftResult> {
     })
 }
 
+/// Repair-turn prompt: the previous attempt's `cargo test` was red. Hand the
+/// agent the failing output and ask for the SMALLEST fix, same guardrails.
+fn build_repair_prompt(spec: &str, gate_output: &str) -> String {
+    format!(
+        "Your previous attempt did NOT pass — `cargo test` failed with the output below. \
+Fix it with the SMALLEST change; keep what already works, don't restart from scratch.\n\n\
+ORIGINAL TASK: {spec}\n\n\
+CARGO TEST OUTPUT (tail):\n{}\n\n\
+Same rules: NEVER weaken, delete, or #[ignore] tests to go green (the test count must \
+not drop); reuse existing helpers; do not add crates; you have Read/Edit/Write and \
+cargo but NOT git. Make cargo test pass, then output ONE JSON object:\n\
+{{\"summary\": \"what you fixed\", \"files_changed\": [\"src/...\"], \"tests_added\": <int>, \"touched_gate_files\": <bool>}}",
+        util::truncate_chars(gate_output.trim(), 3000)
+    )
+}
+
+/// Total self-improvement spend today (components `improve%`) — budget input.
+fn improve_spent_today(conn: &rusqlite::Connection) -> f64 {
+    let day_start = util::day_bounds_local(util::today_local()).map(|(s, _)| s).unwrap_or(0);
+    db::cost_since_like(conn, "improve%", day_start).unwrap_or(0.0)
+}
+
 fn draft_commit_message(id: i64, title: &str, result: Option<&DraftResult>) -> String {
     let body = result
         .map(|r| r.summary.trim())
@@ -758,7 +780,7 @@ fn draft(
         .with_context(|| format!("worktree add selhalo pro větev {branch}"))?;
 
     let base_tests = count_test_attrs(&wt);
-    info!("improve #{}: codegen na {branch} (base {base_tests} testů, {})", imp.id, &base[..12.min(base.len())]);
+    info!("improve #{}: codegen na {branch} (base {base_tests} testů, {})", imp.id, short(&base));
 
     // The codegen agent runs cargo during its edit→test loop; point it at the
     // main repo's warm target dir so those builds are incremental, not a cold
@@ -766,71 +788,125 @@ fn draft(
     // process-wide env var is fine; the gate sets the same dir explicitly.)
     std::env::set_var("CARGO_TARGET_DIR", repo.join("target"));
 
-    let outcome = match claude::run(&claude::ClaudeRequest {
-        prompt,
-        model: if im.model.is_empty() { None } else { Some(im.model.as_str()) },
-        cwd: &wt,
-        allowed_tools: DRAFT_TOOLS,
-        max_turns: im.max_turns,
-        timeout: Duration::from_secs(im.timeout_s),
-    }) {
-        Ok(o) => o,
-        Err(e) => {
-            db::update_improvement_tests(conn, imp.id, None, &util::truncate_chars(&format!("{e:#}"), 2000), STATUS_FAILED)?;
-            cleanup_worktree(&repo, &wt);
-            return Err(e).context("codegen selhal");
+    let model = if im.model.is_empty() { None } else { Some(im.model.as_str()) };
+    let max_attempts = 1 + im.repair_attempts; // initial draft + up to N repairs
+    let mut total_cost = 0.0;
+    let mut summary = String::new();
+    let mut last_gate: Option<GateOutcome> = None;
+    let mut head_short = String::new();
+    let mut envelope = ENV_FEATURE;
+    let mut diff_stat = String::new();
+    let mut head_tests = base_tests;
+
+    for attempt in 0..max_attempts {
+        // repairs cost money too — stop before spending past the daily budget
+        if attempt > 0 {
+            let spent = improve_spent_today(conn);
+            if spent >= im.daily_budget_usd {
+                info!("improve #{}: rozpočet vyčerpán ({spent:.2}/{:.2} USD) — už neopravuji", imp.id, im.daily_budget_usd);
+                break;
+            }
         }
-    };
-    db::add_improvement_cost(conn, imp.id, outcome.cost_usd, outcome.tokens_in, outcome.tokens_out)?;
-    let result = parse_draft_result(&outcome.text);
+        let prompt = match &last_gate {
+            None => build_draft_prompt(&imp.spec, &imp.title),
+            Some(g) => build_repair_prompt(&imp.spec, &g.output),
+        };
+        let outcome = match claude::run(&claude::ClaudeRequest {
+            prompt,
+            model,
+            cwd: &wt,
+            allowed_tools: DRAFT_TOOLS,
+            max_turns: im.max_turns,
+            timeout: Duration::from_secs(im.timeout_s),
+        }) {
+            Ok(o) => o,
+            Err(e) => {
+                db::update_improvement_tests(conn, imp.id, None, &util::truncate_chars(&format!("{e:#}"), 2000), STATUS_FAILED)?;
+                if attempt == 0 {
+                    cleanup_worktree(&repo, &wt); // nothing worth keeping
+                }
+                return Err(e).context("codegen selhal");
+            }
+        };
+        total_cost += outcome.cost_usd;
+        db::add_improvement_cost(conn, imp.id, outcome.cost_usd, outcome.tokens_in, outcome.tokens_out)?;
+        let _ = db::insert_cost(
+            conn,
+            util::now_ts(),
+            if attempt == 0 { "improve" } else { "improve-repair" },
+            &im.model,
+            outcome.tokens_in,
+            outcome.tokens_out,
+            outcome.cost_usd,
+        );
+        let result = parse_draft_result(&outcome.text);
+        if let Some(r) = &result {
+            if !r.summary.is_empty() {
+                summary = r.summary.clone();
+            }
+        }
 
-    if worktree_is_clean(&wt)? {
-        db::update_improvement_tests(conn, imp.id, None, "agent neprovedl žádnou změnu", STATUS_FAILED)?;
-        cleanup_worktree(&repo, &wt);
-        bail!("codegen neprovedl žádnou změnu (#{} → failed)", imp.id);
+        if worktree_is_clean(&wt)? {
+            if attempt == 0 {
+                db::update_improvement_tests(conn, imp.id, None, "agent neprovedl žádnou změnu", STATUS_FAILED)?;
+                cleanup_worktree(&repo, &wt);
+                bail!("codegen neprovedl žádnou změnu (#{} → failed)", imp.id);
+            }
+            info!("improve #{}: oprava nic nezměnila — končím s poslední červenou", imp.id);
+            break;
+        }
+
+        let head = commit_all(&wt, im, &draft_commit_message(imp.id, &imp.title, result.as_ref()))?;
+        head_short = short(&head).to_string();
+        let files = changed_files(&wt, &base)?;
+        envelope = classify_envelope(&files);
+        diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
+        db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
+        info!("improve #{}: commit {head_short} ({} souborů, obálka {envelope}, pokus {})", imp.id, files.len(), attempt + 1);
+
+        // integrity guard: the suite must not shrink
+        head_tests = count_test_attrs(&wt);
+        if !test_integrity_ok(base_tests, head_tests) {
+            let note = format!("test-integrity FAIL: base {base_tests} → head {head_tests} (testy nesmí ubývat)");
+            db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
+            bail!("#{}: {note} — zamítnuto (větev {branch} zůstává k inspekci)", imp.id);
+        }
+
+        // failable gate: build + test
+        let gate = run_gate(&wt, &repo, im)?;
+        if gate.passed {
+            db::update_improvement_tests(conn, imp.id, Some(true), &gate.output, STATUS_TESTED)?;
+            println!("── improve draft #{} ──", imp.id);
+            println!("větev:   {branch}");
+            println!("commit:  {head_short}");
+            println!("obálka:  {envelope}");
+            println!("diff:    {diff_stat}");
+            let repaired = if attempt > 0 { format!(" (po {} opravě/ách)", attempt) } else { String::new() };
+            println!("testy:   base {base_tests} → head {head_tests}; brána ✓ ZELENÁ{repaired}");
+            if !summary.is_empty() {
+                println!("shrnutí: {}", util::truncate_chars(&summary, 200));
+            }
+            println!("náklad:  {total_cost:.4} USD");
+            println!("\n✓ připraveno: jarvis improve show {} → propose/approve", imp.id);
+            return Ok(());
+        }
+        db::update_improvement_tests(conn, imp.id, Some(false), &gate.output, STATUS_FAILED)?;
+        last_gate = Some(gate);
+        if attempt + 1 < max_attempts {
+            info!("improve #{}: brána ČERVENÁ — pokus o opravu ({}/{})", imp.id, attempt + 1, im.repair_attempts);
+        }
     }
 
-    let msg = draft_commit_message(imp.id, &imp.title, result.as_ref());
-    let head = commit_all(&wt, im, &msg)?;
-    let files = changed_files(&wt, &base)?;
-    let envelope = classify_envelope(&files);
-    let diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
-    db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
-    let head_short = &head[..12.min(head.len())];
-    info!("improve #{}: commit {head_short} ({} souborů, obálka {envelope})", imp.id, files.len());
-
-    // integrity guard: the suite must not shrink
-    let head_tests = count_test_attrs(&wt);
-    if !test_integrity_ok(base_tests, head_tests) {
-        let note = format!("test-integrity FAIL: base {base_tests} → head {head_tests} (testy nesmí ubývat)");
-        db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
-        bail!("#{}: {note} — zamítnuto (větev {branch} zůstává k inspekci)", imp.id);
-    }
-
-    // failable gate: build + test
-    let gate = run_gate(&wt, &repo, im)?;
-    let status = if gate.passed { STATUS_TESTED } else { STATUS_FAILED };
-    db::update_improvement_tests(conn, imp.id, Some(gate.passed), &gate.output, status)?;
-
+    // exhausted attempts / budget / no-op repair → failed; keep branch for inspection
     println!("── improve draft #{} ──", imp.id);
     println!("větev:   {branch}");
-    println!("commit:  {head_short}");
-    println!("obálka:  {envelope}");
-    println!("diff:    {diff_stat}");
-    println!("testy:   base {base_tests} → head {head_tests}; brána {}", if gate.passed { "✓ ZELENÁ" } else { "✗ ČERVENÁ" });
-    if let Some(r) = &result {
-        if !r.summary.is_empty() {
-            println!("shrnutí: {}", util::truncate_chars(&r.summary, 200));
-        }
+    if !head_short.is_empty() {
+        println!("commit:  {head_short}  (obálka {envelope}, {diff_stat})");
     }
-    println!("náklad:  {:.4} USD", outcome.cost_usd);
-    if gate.passed {
-        println!("\n✓ připraveno: jarvis improve show {} → (fáze 4) propose/approve", imp.id);
-    } else {
-        println!("\n✗ brána červená → failed. Log: jarvis improve show {}", imp.id);
-        bail!("brána červená");
-    }
-    Ok(())
+    println!("testy:   base {base_tests} → head {head_tests}; brána ✗ ČERVENÁ (vyčerpáno {max_attempts} pokusů)");
+    println!("náklad:  {total_cost:.4} USD");
+    println!("\n✗ nezvládnuto → failed. Log: jarvis improve show {}", imp.id);
+    bail!("brána červená po {max_attempts} pokusech (#{} → failed)", imp.id);
 }
 
 /// `jarvis improve test <id>`: re-run the failable gate on an already-drafted
@@ -1073,6 +1149,15 @@ mod tests {
         assert!(p.contains("do NOT have"), "no-git constraint");
         assert!(p.contains("JSON"), "result contract");
         assert!(p.contains("English"), "house rules");
+    }
+
+    #[test]
+    fn repair_prompt_carries_task_and_failure() {
+        let p = build_repair_prompt("add mask_secret", "test result: FAILED. 1 failed\nassertion `left == right` failed");
+        assert!(p.contains("add mask_secret"), "original task");
+        assert!(p.contains("assertion `left == right`"), "the failure output");
+        assert!(p.contains("did NOT pass"));
+        assert!(p.contains("test count must not drop"), "integrity still enforced on repair");
     }
 
     #[test]

@@ -741,6 +741,17 @@ pub fn set_improvement_merged(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Sum of `costs.usd` since `since` for components matching a LIKE pattern
+/// (e.g. 'improve%'). Input to the self-improvement daily budget guard.
+pub fn cost_since_like(conn: &Connection, like: &str, since: i64) -> Result<f64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(usd), 0) FROM costs WHERE ts >= ?1 AND component LIKE ?2",
+        params![since, like],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// The last `limit` nudges (listing in `status`).
 pub fn recent_nudges(conn: &Connection, limit: usize) -> Result<Vec<NudgeRow>> {
     let mut stmt =
