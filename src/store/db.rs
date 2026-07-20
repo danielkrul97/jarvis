@@ -741,6 +741,16 @@ pub fn set_improvement_merged(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Records a successful self-deploy (status → deployed).
+pub fn set_improvement_deployed(conn: &Connection, id: i64) -> Result<()> {
+    let now = crate::util::now_ts();
+    conn.execute(
+        "UPDATE improvements SET status='deployed', deployed_at=?2, updated_at=?2 WHERE id=?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
 /// Sum of `costs.usd` since `since` for components matching a LIKE pattern
 /// (e.g. 'improve%'). Input to the self-improvement daily budget guard.
 pub fn cost_since_like(conn: &Connection, like: &str, since: i64) -> Result<f64> {

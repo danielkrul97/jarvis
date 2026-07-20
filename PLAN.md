@@ -778,10 +778,10 @@ Konfigurace `[improve]` (vzor v `config.example.toml`), ship-dark
   testů + hermetický git-roundtrip test + ostrý git-worktree smoke (izolace od
   dirty tree, machine-identity commit). **První ostrý (placený) codegen
   spouštíš ty** (`enabled=false`).
-- **Fáze 3 — failable brána: JÁDRO HOTOVO.** `cargo test` na větvi (sdílený
-  target = teplý cache) + test-integrity guard (počet testů nesmí klesnout) +
-  envelope klasifikace. Zbývá: omezená self-repair smyčka (retry při červené do
-  `repair_attempts`) + jemnější assertion-level integrita.
+- **Fáze 3 — failable brána + self-repair: HOTOVO.** `cargo test` na větvi
+  (sdílený teplý target) + test-integrity guard (počet testů nesmí klesnout) +
+  envelope klasifikace. Self-repair: při červené bráně dostane agent výstup
+  testů a zkusí minimální opravu, do `repair_attempts`, s rozpočtovou pojistkou.
 - **Fáze 4 — propose→approve→merge: HOTOVO a ověřeno.** `propose` zapíchne
   sha256 diffu + klasifikuje obálku; `approve` re-verifikuje no-drift
   (base==main HEAD) + TOCTOU (otisk diffu) + čistý main tree, pak
@@ -790,14 +790,20 @@ Konfigurace `[improve]` (vzor v `config.example.toml`), ship-dark
   útraty, bez TTY): propose pin + VŠECHNY brány zamítly (dirty-tree, TOCTOU
   tamper, drift tamper, status), main HEAD nedotčen. Telegram approve (číslo
   z ověřeného chatu) je součást fáze 5.
-- **Fáze 5 — reporting + plán:** sekce „Sebe-vývoj" v digestu (u `build.rs:189`),
-  `improve tick` (≤1 akce/tik, jako nudge), volitelný `jarvis-improve.timer`.
-- **Fáze 6 — self-deploy:** `cargo install` → smoke (`--version`/`doctor`/
-  self-test) → swap `~/.cargo/bin/jarvis` (.prev záloha) → `systemctl --user
-  restart` → post-deploy `doctor`; smoke/health FAIL → rollback `.prev`.
-  POZOR: `units.rs` bere `current_exe()` a odmítá `/target/` build → deploy
-  musí instalovat do `~/.cargo/bin` a teprve pak `install-units`.
-  `enabled`/`deploy_enabled` zůstávají `false` do ověření.
+- **Fáze 5 — autonomie + e-mail: HOTOVO.** `improve tick` (timer entry, ≤1
+  akce/den, denní strop pokusů + rozpočet): draftne frontu → zeleno → propose →
+  **e-mail** (SendGrid, oznámení návrhu; schválení pořád u klávesnice, e-mail
+  NENÍ brána). Self-source (opt-in `allow_self_source`): clippy varování → úkoly.
+  Digest sekce „Sebe-vývoj". systemd `jarvis-improve.timer` (nočně 03:17, zapnutý
+  jen při `enabled=true`). Envelope B: `auto_merge_safe` mergne safe třídu (jen
+  docs) bez ptaní (`should_auto_merge`).
+- **Fáze 6 — self-deploy: HOTOVO.** `improve deploy` (a auto po merge při
+  `deploy_enabled`): záloha binárky do `.prev` → `cargo install --path . --force`
+  → smoke (`--version` + `improve tick --dry-run` na nové binárce) →
+  `install-units` + `systemctl --user restart` → health `is-active`; smoke/health
+  FAIL → obnovit `.prev` + restart (`rolled_back`). E-mail o výsledku. Ověřeno:
+  `deploy --dry-run` + brány (deploy_enabled=false, status musí být merged).
+  **Ostrý self-deploy spouštíš ty** (nerestartuju běžící démona).
 
 **Ověřeno naživo (2026-07-20):** ostrý end-to-end draft na reálném úkolu
 (`util::mask_secret`) — Claude napsal korektní, otestovaný Rust (char-based,
@@ -811,7 +817,12 @@ v produkci (démon pod reálným HOME) tenhle artefakt nevzniká. Zbytkový gap:
 neviděl jsem agentovu self-repair smyčku (v testu neměl funkční cargo, kód dal
 správně napoprvé).
 
-Resume: `src/improve.rs` má dočasný `#![allow(dead_code)]` scaffold (pryč po
-fázi 6). Hotovo: **fáze 1, 2, 3-jádro, 4 + live e2e**. Zbývá: fáze 3-rest
-(self-repair smyčka), **fáze 5** (`tick` + Telegram approve + digest sekce),
-**fáze 6** (self-deploy: rebuild + smoke + swap + rollback + restart).
+**Stav: VŠECH 6 FÁZÍ HOTOVO** (2026-07-20), 277 testů zeleno, 0 warningů,
+scaffold `#![allow(dead_code)]` odstraněn. Vše ship-dark (`[improve]
+enabled=false`, `deploy_enabled=false`, `allow_self_source=false`,
+`auto_merge_safe=false`), NENASAZENO (běžící démon jede starou binárku). Ostré
+ověření naživo výše (draft → gate zeleno). Neodpozorováno: agentova self-repair
+na červené (v testu neměl cargo), ostrý auto-deploy (tvůj trigger). Zapnutí:
+`cargo install --path . --force` + `[improve] enabled=true` (+ volitelně
+`allow_self_source` / `auto_merge_safe` / `deploy_enabled` až získají důvěru) +
+`jarvis install-units`.

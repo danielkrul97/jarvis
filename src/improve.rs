@@ -23,12 +23,6 @@
 //!
 //! Layout mirrors `nudge.rs`: pure, unit-tested logic (envelope classification,
 //! guards, branch naming, confirm parsing) with a thin DB/git/API shell on top.
-//!
-//! NOTE: this module is built phase by phase. Phase 1 lands the full data model
-//! and pure logic (with tests); the lifecycle shell that consumes them lands in
-//! phases 2–6. The scaffold allow below is removed once the shell is complete.
-
-#![allow(dead_code)]
 
 use crate::config::{Config, ImproveCfg, Paths};
 use crate::pipeline::claude;
@@ -59,8 +53,7 @@ pub const STATUS_QUEUED: &str = "queued"; // task accepted, not drafted yet
 pub const STATUS_DRAFTING: &str = "drafting"; // codegen running on a branch
 pub const STATUS_TESTED: &str = "tested"; // branch built + tested green
 pub const STATUS_PROPOSED: &str = "proposed"; // diff pinned, awaiting approval
-pub const STATUS_APPROVED: &str = "approved"; // human approved, pre-merge
-pub const STATUS_MERGED: &str = "merged"; // landed on main
+pub const STATUS_MERGED: &str = "merged"; // landed on main (db writes the 'approved' state directly)
 pub const STATUS_DEPLOYED: &str = "deployed"; // live binary rebuilt + restarted
 pub const STATUS_FAILED: &str = "failed"; // tests red / codegen error
 pub const STATUS_DISMISSED: &str = "dismissed"; // abandoned by human
@@ -148,27 +141,6 @@ fn is_valid_source(s: &str) -> bool {
     )
 }
 
-/// Remote/typed confirmation "ano N" / "ne N". As with runbooks and nudges, a
-/// bare "ano" carries NO id and must never approve anything — the number is
-/// mandatory. Tolerant of case and surrounding punctuation.
-pub fn parse_confirm(text: &str) -> Option<(bool, i64)> {
-    // fold diacritics so "zahoď"/"schvaľ" match their ASCII verb forms
-    let t: String = text
-        .chars()
-        .flat_map(char::to_lowercase)
-        .map(util::fold_ascii)
-        .collect();
-    let mut tokens = t
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|s| !s.is_empty());
-    let yes = match tokens.next()? {
-        "ano" | "jo" | "ok" | "schval" | "merge" => true,
-        "ne" | "zahod" | "zamitni" => false,
-        _ => return None,
-    };
-    Some((yes, tokens.next()?.parse().ok()?))
-}
-
 // ---------- repo location ----------
 
 /// Absolute path of the source repository. Config `improve.repo_dir` wins;
@@ -220,7 +192,12 @@ pub enum ImproveCmd {
     /// Approve + merge to main (TTY typed-token or verified Telegram)  [phase 4]
     Approve { id: i64 },
     /// Deploy a merged change: rebuild, smoke-test, swap with rollback, restart  [phase 6]
-    Deploy { id: i64 },
+    Deploy {
+        id: i64,
+        /// Show the plan only — no build, no swap, no restart
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// One scheduler tick (queued → draft → test → propose); --dry-run just previews  [phase 5]
     Tick {
         #[arg(long)]
@@ -308,12 +285,8 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
         ImproveCmd::Test { id } => test_cmd(paths, cfg, conn, id),
         ImproveCmd::Propose { id } => propose(cfg, conn, id),
         ImproveCmd::Approve { id } => approve(paths, cfg, conn, id),
-        ImproveCmd::Deploy { .. } => not_yet(6, "deploy (rebuild + smoke + swap + restart)"),
+        ImproveCmd::Deploy { id, dry_run } => deploy(paths, cfg, conn, id, dry_run),
     }
-}
-
-fn not_yet(phase: u8, what: &str) -> Result<()> {
-    bail!("„{what}“ je fáze {phase} — v tomto buildu ještě neimplementováno (ship-dark scaffold)")
 }
 
 // ---------- email notifications (send-only channel) ----------
@@ -456,7 +429,32 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
         Ok(()) => {
             if let Err(e) = propose(cfg, conn, imp.id) {
                 warn!("improve tick: propose #{} selhal: {e:#}", imp.id);
-            } else if let Ok(Some(p)) = db::improvement_by_id(conn, imp.id) {
+                return Ok(());
+            }
+            let Ok(Some(p)) = db::improvement_by_id(conn, imp.id) else {
+                return Ok(());
+            };
+            if should_auto_merge(im.auto_merge_safe, &p.envelope) {
+                info!("improve tick: #{} je safe třída + auto_merge_safe → merguji bez ptaní", p.id);
+                let _ = db::set_improvement_approved(conn, p.id, "auto");
+                match merge_improvement(paths, cfg, conn, &p) {
+                    Ok(_) => {
+                        if im.deploy_enabled {
+                            if let Err(e) = deploy(paths, cfg, conn, p.id, false) {
+                                warn!("improve tick: auto-deploy #{} selhal: {e:#}", p.id);
+                            }
+                        }
+                        if let Ok(Some(done)) = db::improvement_by_id(conn, p.id) {
+                            let subj = format!("Jarvis: vylepšení #{} — {}", p.id, done.status);
+                            let _ = email_notify(paths, cfg, &subj, &format!("#{} {} → stav {}\n", p.id, p.title, done.status));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("improve tick: auto-merge #{} selhal ({e:#}) — nechávám na tobě", p.id);
+                        notify_proposed(paths, cfg, &p);
+                    }
+                }
+            } else {
                 notify_proposed(paths, cfg, &p);
             }
         }
@@ -766,24 +764,15 @@ Title: {title}"
 #[derive(Debug, Default)]
 struct DraftResult {
     summary: String,
-    files_changed: Vec<String>,
-    tests_added: i64,
-    touched_gate_files: bool,
 }
 
-/// Best-effort parse of the agent's JSON result (context only — Jarvis computes
-/// the authoritative diff/envelope from git regardless).
+/// Best-effort parse of the agent's JSON result — only the one-line summary is
+/// consumed (Jarvis computes the authoritative diff/envelope/tests from git).
 fn parse_draft_result(text: &str) -> Option<DraftResult> {
     let json = claude::extract_json(text).ok()?;
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     Some(DraftResult {
         summary: v["summary"].as_str().unwrap_or_default().to_string(),
-        files_changed: v["files_changed"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
-        tests_added: v["tests_added"].as_i64().unwrap_or(0),
-        touched_gate_files: v["touched_gate_files"].as_bool().unwrap_or(false),
     })
 }
 
@@ -858,10 +847,13 @@ fn run_gate(worktree: &Path, repo: &Path, im: &ImproveCfg) -> Result<GateOutcome
     let envs = [("CARGO_TARGET_DIR", target_s.as_ref())];
     let timeout = Duration::from_secs(im.timeout_s.max(600));
     info!("improve: cargo test na větvi ({})", worktree.display());
-    let test = run_capture("cargo", &["test", "--quiet"], worktree, &envs, timeout)?;
+    let test = run_capture("cargo", &["test"], worktree, &envs, timeout)?;
     let combined = format!("{}\n{}", test.stdout, test.stderr);
     let passed = !test.timed_out && test.code == Some(0);
     let mut output = util::truncate_chars(combined.trim(), 6000);
+    if let Some((ok, n)) = parse_test_summary(&combined) {
+        output.push_str(&format!("\n[jarvis] cargo test: {n} testů ({})", if ok { "ok" } else { "SELHALO" }));
+    }
     if test.timed_out {
         output.push_str(&format!("\n[jarvis] cargo test zabit po {} s", timeout.as_secs()));
     }
@@ -1159,22 +1151,188 @@ fn approve(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64) ->
         &id.to_string(),
     )?;
     db::set_improvement_approved(conn, id, "cli")?;
-
-    // fast-forward: the branch is main + the improvement commit, so main advances
-    // to the Jarvis-authored commit with no merge commit and no tree churn
-    git(&repo, &["merge", "--ff-only", &imp.branch])
-        .with_context(|| format!("merge --ff-only {} selhal — #{id} zůstává approved, řeš ručně", imp.branch))?;
-    db::set_improvement_merged(conn, id)?;
-    cleanup_worktree(&repo, &worktree_path(paths, id));
-    let _ = git(&repo, &["branch", "-d", &imp.branch]);
-    let new_head = git_head(&repo, "main").unwrap_or_default();
+    // merge_improvement re-verifies drift/TOCTOU/clean-tree again — the tree
+    // could have changed while the human was typing the confirmation
+    let new_head = merge_improvement(paths, cfg, conn, &imp)?;
     println!("✓ #{id} smergnuto do main (HEAD {})", short(&new_head));
     println!("  commit autor: {} <{}>", cfg.improve.author_name, cfg.improve.author_email);
+    finish_or_deploy(paths, cfg, conn, &imp)
+}
+
+// ---------- merge + deploy (phase 4/6 shared) ----------
+
+/// Re-verifies (no drift, pinned diff, clean tree) then fast-forwards main to
+/// the improvement's commit and records the merge + cleanup. Authorization is
+/// the CALLER's job (TTY confirm in `approve`, or safe-class auto-merge in
+/// `tick`). Runs the TOCTOU re-check itself, so it is safe after any delay.
+fn merge_improvement(
+    paths: &Paths,
+    cfg: &Config,
+    conn: &rusqlite::Connection,
+    imp: &db::ImprovementRow,
+) -> Result<String> {
+    let repo = repo_root(cfg);
+    let main_head = git_head(&repo, "main")?;
+    ensure!(main_head == imp.base_commit, "main se pohnul od návrhu (#{}) — nutný re-draft", imp.id);
+    let diff = git(&repo, &["diff", &imp.base_commit, &imp.head_commit])?;
+    ensure!(
+        util::sha256_hex(diff.as_bytes()) == imp.diff_sha256,
+        "diff #{} se změnil (otisk nesedí) — NEMERGUJI",
+        imp.id
+    );
+    ensure!(worktree_is_clean(&repo)?, "main má necommitnuté změny — ukliď před merge #{}", imp.id);
+    git(&repo, &["merge", "--ff-only", &imp.branch])
+        .with_context(|| format!("merge --ff-only {} selhal — #{} zůstává, řeš ručně", imp.branch, imp.id))?;
+    db::set_improvement_merged(conn, imp.id)?;
+    cleanup_worktree(&repo, &worktree_path(paths, imp.id));
+    let _ = git(&repo, &["branch", "-d", &imp.branch]);
+    git_head(&repo, "main")
+}
+
+/// Should `tick` auto-merge this green change without asking? Only the docs-only
+/// safe class, and only when auto_merge_safe is on. Gate-critical and ordinary
+/// code always wait for a human — even under auto_merge_safe.
+pub fn should_auto_merge(auto_merge_safe: bool, envelope: &str) -> bool {
+    auto_merge_safe && envelope == ENV_SAFE
+}
+
+/// After a merge: auto-deploy when enabled, otherwise print the manual step.
+fn finish_or_deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, imp: &db::ImprovementRow) -> Result<()> {
     if cfg.improve.deploy_enabled {
-        println!("  nasazení: jarvis improve deploy {id}  (fáze 6: rebuild + smoke + restart)");
+        println!("  deploy_enabled=true → nasazuji…");
+        deploy(paths, cfg, conn, imp.id, false)
     } else {
         println!("  nasazení ručně: cargo install --path . --force  (deploy_enabled=false)");
+        Ok(())
     }
+}
+
+/// Where `cargo install` places the binary (CARGO_HOME/bin, else ~/.cargo/bin).
+fn install_path() -> PathBuf {
+    if let Some(ch) = std::env::var_os("CARGO_HOME") {
+        return PathBuf::from(ch).join("bin").join("jarvis");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join(".cargo/bin/jarvis")
+}
+
+/// Smoke-tests a freshly built binary WITHOUT touching the daemons: it must
+/// report a version and survive a real config-load + DB-open (`improve tick
+/// --dry-run`). Enough to catch a broken build before we restart anything.
+fn smoke_test(bin: &Path) -> Result<()> {
+    let bin_s = bin.to_str().context("binárka: cesta není UTF-8")?;
+    let tmp = std::env::temp_dir();
+    let v = run_capture(bin_s, &["--version"], &tmp, &[], Duration::from_secs(30))?;
+    ensure!(
+        v.code == Some(0) && v.stdout.to_lowercase().contains("jarvis"),
+        "`{bin_s} --version` neproběhl (exit {:?})",
+        v.code
+    );
+    let t = run_capture(bin_s, &["improve", "tick", "--dry-run"], &tmp, &[], Duration::from_secs(60))?;
+    ensure!(t.code == Some(0), "`improve tick --dry-run` na nové binárce selhal (exit {:?})", t.code);
+    Ok(())
+}
+
+/// Is the core daemon active after a restart? (capture is always enabled.)
+fn capture_active() -> bool {
+    matches!(
+        run_capture("systemctl", &["--user", "is-active", "jarvis-capture.service"], &std::env::temp_dir(), &[], Duration::from_secs(15)),
+        Ok(o) if o.stdout.trim() == "active"
+    )
+}
+
+fn notify_deploy(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow, ok: bool, detail: &str) {
+    let subject = if ok {
+        format!("Jarvis: nasazeno vylepšení #{} — {}", imp.id, util::truncate_chars(&imp.title, 50))
+    } else {
+        format!("Jarvis: deploy #{} VRÁCEN zpět", imp.id)
+    };
+    let head = if ok { "✓ NASAZENO (rebuild + smoke + restart)" } else { "✗ VRÁCENO na .prev" };
+    let body = format!("#{}  {}\n{head}\n{detail}\n", imp.id, imp.title);
+    if let Err(e) = email_notify(paths, cfg, &subject, &body) {
+        warn!("improve: e-mail o deploy #{} selhal: {e:#}", imp.id);
+    }
+}
+
+/// `jarvis improve deploy <id>`: rebuild + install the merged change, smoke-test
+/// the new binary, and only if it passes reinstall units + restart the daemons.
+/// On ANY failure the previous binary is restored from `.prev`. Gated by
+/// deploy_enabled; the highest-stakes step, so every path fails safe.
+fn deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64, dry_run: bool) -> Result<()> {
+    let im = &cfg.improve;
+    let imp = db::improvement_by_id(conn, id)?.with_context(|| format!("vylepšení #{id} neexistuje"))?;
+    let repo = repo_root(cfg);
+    let bin = install_path();
+    let prev = bin.with_extension("prev");
+    let repo_s = repo.to_str().context("repo: cesta není UTF-8")?;
+    let bin_s = bin.to_string_lossy().to_string();
+
+    if dry_run {
+        println!("── improve deploy #{id} (dry-run — nic se nespustí) ──");
+        println!("stav:          {}", imp.status);
+        println!("deploy_enabled: {}", im.deploy_enabled);
+        println!("binárka:       {}", bin.display());
+        println!("záloha:        {}", prev.display());
+        println!("1) build:      cargo install --path {repo_s} --force");
+        println!("2) smoke:      {bin_s} --version  +  improve tick --dry-run");
+        println!("3) units+restart: {bin_s} install-units  +  systemctl --user restart jarvis-capture/listen");
+        println!("rollback:      smoke/health FAIL → obnovit {} → restart", prev.display());
+        return Ok(());
+    }
+
+    ensure!(im.deploy_enabled, "[improve] deploy_enabled=false — self-deploy je vypnutý");
+    ensure!(imp.status == STATUS_MERGED, "deploy jde jen na 'merged' (#{id} je '{}')", imp.status);
+    ensure!(bin.parent().map(|p| p.exists()).unwrap_or(false), "cíl instalace {} neexistuje", bin.display());
+
+    // 1. back up the current (running) binary — the process keeps its old inode
+    if bin.exists() {
+        std::fs::copy(&bin, &prev)
+            .with_context(|| format!("záloha {} → {} selhala", bin.display(), prev.display()))?;
+        info!("deploy #{id}: záloha do {}", prev.display());
+    }
+
+    // 2. build + install release (overwrites the binary file)
+    info!("deploy #{id}: cargo install --path {repo_s} --force (release build — chvíli to trvá)");
+    let inst = run_capture("cargo", &["install", "--path", repo_s, "--force"], &repo, &[], Duration::from_secs(im.timeout_s.max(2400)))?;
+    if inst.timed_out || inst.code != Some(0) {
+        db::set_improvement_status(conn, id, STATUS_MERGED, "cargo install selhal (binárka nezměněna)")?;
+        bail!("cargo install selhal — stará binárka zůstává:\n{}", util::truncate_chars(inst.stderr.trim(), 1200));
+    }
+
+    // 3. smoke-test the NEW binary before touching any daemon
+    if let Err(e) = smoke_test(&bin) {
+        if prev.exists() {
+            let _ = std::fs::copy(&prev, &bin);
+        }
+        db::set_improvement_status(conn, id, STATUS_ROLLED_BACK, &format!("smoke selhal: {e:#}"))?;
+        notify_deploy(paths, cfg, &imp, false, &format!("smoke-test selhal: {e:#}"));
+        bail!("smoke-test nové binárky selhal — vráceno na .prev: {e:#}");
+    }
+
+    // 4. reinstall units (path/features may have changed) + restart daemons
+    let _ = run_capture(&bin_s, &["install-units"], &repo, &[], Duration::from_secs(60));
+    let _ = run_capture(
+        "systemctl",
+        &["--user", "restart", "jarvis-capture.service", "jarvis-listen.service"],
+        &repo,
+        &[],
+        Duration::from_secs(60),
+    );
+
+    // 5. health check; roll back if the daemon didn't come up
+    if !capture_active() {
+        if prev.exists() {
+            let _ = std::fs::copy(&prev, &bin);
+        }
+        let _ = run_capture("systemctl", &["--user", "restart", "jarvis-capture.service"], &repo, &[], Duration::from_secs(60));
+        db::set_improvement_status(conn, id, STATUS_ROLLED_BACK, "démon po deploy nenaběhl, vráceno")?;
+        notify_deploy(paths, cfg, &imp, false, "démon po restartu nebyl 'active' — vráceno na .prev");
+        bail!("démon po deploy nenaběhl — vráceno na .prev");
+    }
+
+    db::set_improvement_deployed(conn, id)?;
+    notify_deploy(paths, cfg, &imp, true, &format!("HEAD {}", short(&imp.head_commit)));
+    println!("✓ #{id} nasazeno: binárka přebuilděna, smoke OK, démon restartován (.prev = rollback).");
     Ok(())
 }
 
@@ -1245,19 +1403,6 @@ mod tests {
     }
 
     #[test]
-    fn confirm_requires_a_number() {
-        assert_eq!(parse_confirm("ano 5"), Some((true, 5)));
-        assert_eq!(parse_confirm("schval 12"), Some((true, 12)));
-        assert_eq!(parse_confirm("ne 5"), Some((false, 5)));
-        assert_eq!(parse_confirm("zahoď 7"), Some((false, 7)));
-        // bare yes/no carries no id → must do nothing
-        assert_eq!(parse_confirm("ano"), None);
-        assert_eq!(parse_confirm("ne"), None);
-        assert_eq!(parse_confirm("možná"), None);
-        assert_eq!(parse_confirm(""), None);
-    }
-
-    #[test]
     fn title_from_spec_takes_first_line() {
         assert_eq!(title_from_spec("Přidej RSS\ndruhý řádek"), "Přidej RSS");
         assert_eq!(title_from_spec("  oříznu okraje  "), "oříznu okraje");
@@ -1280,13 +1425,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_draft_result_reads_json_with_fences() {
-        let text = "Hotovo.\n```json\n{\"summary\":\"add RSS reader\",\"files_changed\":[\"src/rss.rs\"],\"tests_added\":3,\"touched_gate_files\":false}\n```";
-        let r = parse_draft_result(text).unwrap();
-        assert_eq!(r.summary, "add RSS reader");
-        assert_eq!(r.files_changed, vec!["src/rss.rs".to_string()]);
-        assert_eq!(r.tests_added, 3);
-        assert!(!r.touched_gate_files);
+    fn parse_draft_result_reads_summary_from_json() {
+        let text = "Hotovo.\n```json\n{\"summary\":\"add RSS reader\",\"tests_added\":3}\n```";
+        assert_eq!(parse_draft_result(text).unwrap().summary, "add RSS reader");
         assert!(parse_draft_result("žádný json").is_none());
     }
 
@@ -1301,6 +1442,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_merge_only_safe_class_and_only_when_enabled() {
+        assert!(should_auto_merge(true, ENV_SAFE));
+        assert!(!should_auto_merge(false, ENV_SAFE), "flag off → never auto-merge");
+        assert!(!should_auto_merge(true, ENV_FEATURE), "ordinary code always needs a human");
+        assert!(!should_auto_merge(true, ENV_GATE_CRITICAL), "gate code never auto-merges");
+    }
+
+    #[test]
     fn repair_prompt_carries_task_and_failure() {
         let p = build_repair_prompt("add mask_secret", "test result: FAILED. 1 failed\nassertion `left == right` failed");
         assert!(p.contains("add mask_secret"), "original task");
@@ -1311,7 +1460,7 @@ mod tests {
 
     #[test]
     fn commit_message_has_improvement_trailer() {
-        let r = DraftResult { summary: "add RSS".into(), ..Default::default() };
+        let r = DraftResult { summary: "add RSS".into() };
         let m = draft_commit_message(7, "Add RSS reader", Some(&r));
         assert!(m.starts_with("Add RSS reader\n"));
         assert!(m.contains("add RSS"));
