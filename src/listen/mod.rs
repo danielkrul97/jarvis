@@ -662,6 +662,7 @@ fn handle_utterance(
 /// the batch STT thread (transcribe → here) and the realtime worker (WS commit
 /// → here), so both paths get identical conversation behaviour. `proc_secs` =
 /// processing time for the rtf log (batch transcribe / realtime commit).
+#[allow(clippy::too_many_arguments)]
 fn deliver_transcript(
     conn: &rusqlite::Connection,
     t: &stt::Transcript,
