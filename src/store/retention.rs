@@ -4,8 +4,8 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use tracing::warn;
 
-/// Smaže soubory screenshotů starších než `older_than_secs` a vyNULLuje
-/// jejich shot_path (metadata vzorků zůstávají). Vrací počet odstraněných.
+/// Deletes screenshot files older than `older_than_secs` and NULLs their
+/// shot_path (sample metadata stays). Returns the count removed.
 pub fn purge(conn: &Connection, data_dir: &Path, older_than_secs: i64) -> Result<usize> {
     let cutoff = util::now_ts() - older_than_secs;
     let rows: Vec<(i64, String)> = {
@@ -20,7 +20,7 @@ pub fn purge(conn: &Connection, data_dir: &Path, older_than_secs: i64) -> Result
 
     let mut removed = 0usize;
     for (id, rel) in rows {
-        // obrana proti path traversal — mažeme jen uvnitř shots/
+        // defense against path traversal — only delete inside shots/
         if rel.starts_with('/') || !rel.starts_with("shots/") || rel.split('/').any(|c| c == "..")
         {
             warn!("podezřelá cesta snímku v DB, přeskakuji: {rel}");
@@ -31,7 +31,7 @@ pub fn purge(conn: &Connection, data_dir: &Path, older_than_secs: i64) -> Result
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed += 1,
             Err(e) => {
-                // nejde smazat → necháme shot_path, zkusí se příště
+                // can't delete → leave shot_path, retry next time
                 warn!("nelze smazat {}: {e}", path.display());
                 continue;
             }
@@ -39,7 +39,7 @@ pub fn purge(conn: &Connection, data_dir: &Path, older_than_secs: i64) -> Result
         conn.execute("UPDATE samples SET shot_path = NULL WHERE id = ?1", params![id])?;
     }
 
-    // odstraň prázdné denní adresáře (remove_dir maže jen prázdné)
+    // remove empty daily directories (remove_dir only removes empty ones)
     if let Ok(entries) = std::fs::read_dir(data_dir.join("shots")) {
         for entry in entries.flatten() {
             let _ = std::fs::remove_dir(entry.path());
@@ -95,7 +95,7 @@ mod tests {
         }
         assert_eq!(purge(&conn, &tmp, 7 * 86400).unwrap(), 0);
         assert!(victim.exists());
-        // podezřelé cesty zůstávají v DB jako stopa, nic se nemaže
+        // suspicious paths remain in the DB as a trace; nothing gets deleted
         let rows = db::samples_between(&conn, 0, now).unwrap();
         assert!(rows.iter().all(|s| s.shot_path.is_some()));
         std::fs::remove_dir_all(&tmp).unwrap();

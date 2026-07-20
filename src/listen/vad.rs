@@ -1,11 +1,13 @@
-//! Energetický VAD (voice activity detection) s adaptivním šumovým prahem.
+//! Energy-based VAD (voice activity detection) with an adaptive noise threshold.
 //!
-//! Záměrně jednoduchý a plně testovatelný: RMS rámce se porovnává s násobkem
-//! plovoucího šumového dna. Promluva začíná hlasitým rámcem (s pre-rollem, aby
-//! se neusekl náběh prvního slova), končí po `silence_ms` ticha a příliš dlouhá
-//! řeč se dělí po `max_utterance_ms` (whisper zpracovává max 30s okno).
-//! Známá mez: náhlý trvalý hluk (větrák, hudba) projde do STT a odfiltruje ho
-//! až no-speech práh whisperu — upgrade path na Silero VAD je v PLAN.md.
+//! Deliberately simple and fully testable: frame RMS is compared against a
+//! multiple of a floating noise floor. An utterance starts on a loud frame
+//! (with a pre-roll so the first word's onset isn't cut off), ends after
+//! `silence_ms` of silence, and speech that runs too long is split at
+//! `max_utterance_ms` (whisper handles a max 30s window). Known limitation:
+//! sudden sustained noise (fan, music) passes through to STT and only gets
+//! filtered by whisper's no-speech threshold — the upgrade path to Silero VAD
+//! is in PLAN.md.
 
 use std::collections::VecDeque;
 
@@ -13,19 +15,20 @@ pub const SAMPLE_RATE: usize = 16_000;
 pub const FRAME_MS: u64 = 30;
 pub const FRAME_SAMPLES: usize = SAMPLE_RATE * FRAME_MS as usize / 1000; // 480
 
-/// Práh řeči = max(šumové dno × speech_mult, MIN_THRESHOLD); RMS na škále [-1, 1].
-/// speech_mult je v configu (`listen.vad_speech_mult`) — na tichém mikrofonu
-/// s malým SNR (naměřeno 2026-07-17: řeč jen ~14 dB nad šumem) sekal násobek 3
-/// věty na fragmenty; default je proto 2.0.
+/// Speech threshold = max(noise floor × speech_mult, MIN_THRESHOLD); RMS on
+/// a [-1, 1] scale. speech_mult lives in config (`listen.vad_speech_mult`) —
+/// on a quiet mic with low SNR (measured 2026-07-17: speech only ~14 dB above
+/// noise) a multiplier of 3 chopped sentences into fragments; default is
+/// therefore 2.0.
 const MIN_THRESHOLD: f32 = 0.0045;
-/// EMA šumového dna (aktualizuje se jen na tichých rámcích; τ ≈ 0,6 s).
+/// EMA of the noise floor (updated only on silent frames; τ ≈ 0.6 s).
 const FLOOR_ALPHA: f32 = 0.05;
 const FLOOR_INIT: f32 = 0.003;
-/// Kolik zvuku před prvním hlasitým rámcem se přibalí (náběh slova).
+/// How much audio before the first loud frame to keep (word onset).
 const PREROLL_MS: u64 = 300;
-/// Překryv při nuceném dělení dlouhé řeči — ať se neusekne slovo přesně v řezu.
+/// Overlap when force-splitting long speech — so a word isn't cut exactly at the split.
 const SPLIT_CARRY_MS: u64 = 200;
-/// Kolik koncového ticha v promluvě nechat; zbytek se ořízne (šetří STT).
+/// How much trailing silence to keep in an utterance; the rest is trimmed (saves STT).
 const TAIL_SILENCE_MS: u64 = 150;
 
 #[derive(Debug, Clone)]
@@ -33,11 +36,11 @@ pub struct VadConfig {
     pub min_speech_ms: u64,
     pub silence_ms: u64,
     pub max_utterance_ms: u64,
-    /// Násobek šumového dna, od kterého je rámec „řeč".
+    /// Multiple of the noise floor above which a frame counts as "speech".
     pub speech_mult: f32,
 }
 
-/// Ucelená promluva: PCM 16 kHz mono + epochy začátku/konce (sekundy).
+/// A complete utterance: PCM 16 kHz mono + start/end epochs (seconds).
 #[derive(Debug)]
 pub struct Utterance {
     pub samples: Vec<i16>,
@@ -79,19 +82,39 @@ impl Vad {
         }
     }
 
-    /// Práh je veřejný kvůli diagnostice (doctor --live).
+    /// The threshold is public for diagnostics (doctor --live).
     pub fn threshold(&self) -> f32 {
         (self.floor * self.cfg.speech_mult).max(MIN_THRESHOLD)
     }
 
-    /// Zahodí rozpracovaný stav (pauza snímání).
+    /// Accumulated speech duration in the current utterance (ms); 0 = not
+    /// speaking right now. The mic loop uses it to detect voice-onset during
+    /// Jarvis's speech (barge-in).
+    pub fn active_voiced_ms(&self) -> u64 {
+        match &self.state {
+            State::Active { voiced_ms, .. } => *voiced_ms,
+            State::Idle => 0,
+        }
+    }
+
+    /// Epoch (s) when the running utterance started, if one is active — used
+    /// to pair an acoustic barge-in with the utterance that triggered it (see
+    /// handle_utterance).
+    pub fn active_started_at(&self) -> Option<i64> {
+        match &self.state {
+            State::Active { started_at, .. } => Some(*started_at),
+            State::Idle => None,
+        }
+    }
+
+    /// Drops any in-progress state (capture paused).
     pub fn reset(&mut self) {
         self.state = State::Idle;
         self.preroll.clear();
     }
 
-    /// Přijme jeden rámec (`FRAME_SAMPLES` vzorků) a případně vrátí
-    /// dokončenou promluvu. `now_ts` = epocha příchodu rámce v sekundách.
+    /// Accepts one frame (`FRAME_SAMPLES` samples) and optionally returns a
+    /// completed utterance. `now_ts` = frame arrival epoch in seconds.
     pub fn push_frame(&mut self, frame: &[i16], now_ts: i64) -> Option<Utterance> {
         let loud = rms(frame) >= self.threshold();
         match &mut self.state {
@@ -108,7 +131,7 @@ impl Vad {
                         started_at: now_ts - ((preroll_ms + FRAME_MS) / 1000) as i64,
                     };
                 } else {
-                    // šumové dno se učí jen z ticha
+                    // the noise floor is only learned from silence
                     self.floor += FLOOR_ALPHA * (rms(frame) - self.floor);
                     self.preroll.extend(frame.iter().copied());
                     while self.preroll.len() > ms_to_samples(PREROLL_MS) {
@@ -124,8 +147,8 @@ impl Vad {
                     *trailing_ms = 0;
                 } else {
                     *trailing_ms += FRAME_MS;
-                    // ticho uvnitř/za řečí smí dno aktualizovat taky (pomalu
-                    // rostoucí hluk nesmí držet Active navěky)
+                    // silence inside/after speech may also update the floor
+                    // (slowly rising noise must not keep Active forever)
                     self.floor += FLOOR_ALPHA * (rms(frame) - self.floor);
                 }
 
@@ -136,7 +159,7 @@ impl Vad {
                     let mut samples = std::mem::take(buf);
                     self.state = State::Idle;
                     if voiced < self.cfg.min_speech_ms {
-                        return None; // kliknutí, ťuknutí — zahodit
+                        return None; // click, tap — drop it
                     }
                     let cut_ms = trailing.saturating_sub(TAIL_SILENCE_MS);
                     samples.truncate(samples.len().saturating_sub(ms_to_samples(cut_ms)));
@@ -149,16 +172,20 @@ impl Vad {
 
                 let buf_ms = (buf.len() * 1000 / SAMPLE_RATE) as u64;
                 if buf_ms >= self.cfg.max_utterance_ms {
-                    // nucený řez dlouhé řeči; kousek konce si přeneseme do
-                    // další promluvy, ať řez nepůlí slovo tak tvrdě
+                    // force-split long speech; carry a tail slice into the next
+                    // utterance so the cut doesn't slice a word too hard
                     let carry_len = ms_to_samples(SPLIT_CARRY_MS).min(buf.len());
                     let carry: Vec<i16> = buf[buf.len() - carry_len..].to_vec();
-                    let samples = std::mem::take(buf);
+                    // carry is the onset of the NEXT utterance — trim it off the
+                    // one being sent, so the same 200 ms isn't transcribed twice
+                    // (end of N == start of N+1)
+                    let mut samples = std::mem::take(buf);
+                    samples.truncate(samples.len() - carry_len);
                     let started = *started_at;
                     let voiced = *voiced_ms;
                     self.state = State::Active {
                         buf: carry,
-                        voiced_ms: FRAME_MS, // pokračující řeč se prokáže dalšími rámci
+                        voiced_ms: FRAME_MS, // continuing speech will prove itself via later frames
                         trailing_ms: 0,
                         started_at: now_ts,
                     };
@@ -176,7 +203,7 @@ impl Vad {
         }
     }
 
-    /// Uzavře rozpracovanou promluvu (konec WAV souboru; démon flush nevolá).
+    /// Closes an in-progress utterance (end of a WAV file; the daemon never calls flush).
     pub fn flush(&mut self, now_ts: i64) -> Option<Utterance> {
         let state = std::mem::replace(&mut self.state, State::Idle);
         if let State::Active { buf, voiced_ms, started_at, .. } = state {
@@ -206,7 +233,7 @@ mod tests {
             .collect()
     }
 
-    /// Deterministický slabý šum (LCG) — realistické „ticho" mikrofonu.
+    /// Deterministic weak noise (LCG) — realistic mic "silence".
     fn noise(ms: u64, amp: i16, seed: &mut u64) -> Vec<i16> {
         (0..ms_to_samples(ms))
             .map(|_| {
@@ -216,7 +243,7 @@ mod tests {
             .collect()
     }
 
-    /// Prožene signál VAD po rámcích s tikající epochou; vrací promluvy.
+    /// Feeds a signal through the VAD frame by frame with a ticking epoch; returns utterances.
     fn feed(vad: &mut Vad, signal: &[i16], t_ms: &mut u64) -> Vec<Utterance> {
         let mut out = Vec::new();
         for frame in signal.chunks(FRAME_SAMPLES) {
@@ -240,7 +267,7 @@ mod tests {
         let utts = feed(&mut vad, &noise(3000, 60, &mut seed), &mut t);
         assert!(utts.is_empty());
         assert!(vad.flush(1_000_003).is_none());
-        // dno se přizpůsobilo šumu (RMS šumu amp 60 ≈ 0.001)
+        // the floor adapted to the noise (RMS of noise amp 60 ≈ 0.001)
         assert!(vad.threshold() >= MIN_THRESHOLD);
     }
 
@@ -255,10 +282,10 @@ mod tests {
         let utts = feed(&mut vad, &signal, &mut t);
         assert_eq!(utts.len(), 1, "čekám přesně jednu promluvu");
         let u = &utts[0];
-        // preroll(300) + řeč(600) + ponechaný ocas ticha(~150) ± rámce
+        // preroll(300) + speech(600) + kept silence tail(~150) ± frames
         let ms = u.samples.len() * 1000 / SAMPLE_RATE;
         assert!((900..=1400).contains(&ms), "délka {ms} ms mimo očekávání");
-        // začátek ≈ epocha 1_000_000 + ~0.7 s (řeč začíná v t=1.0 s, preroll 0.3 s)
+        // start ≈ epoch 1_000_000 + ~0.7 s (speech starts at t=1.0 s, preroll 0.3 s)
         assert!((1_000_000..=1_000_001).contains(&u.started_at), "start {}", u.started_at);
         assert!(u.ended_at >= u.started_at);
     }
@@ -269,7 +296,7 @@ mod tests {
         let mut seed = 3;
         let mut t = 0;
         let mut signal = noise(1000, 60, &mut seed);
-        signal.extend(sine(60, 0.4)); // kliknutí 60 ms
+        signal.extend(sine(60, 0.4)); // 60 ms click
         signal.extend(noise(1500, 60, &mut seed));
         let utts = feed(&mut vad, &signal, &mut t);
         assert!(utts.is_empty(), "kliknutí nemá být promluva");
@@ -281,14 +308,14 @@ mod tests {
         let mut seed = 9;
         let mut t = 0;
         let mut signal = noise(1000, 60, &mut seed);
-        signal.extend(sine(65_000, 0.25)); // 65 s nepřetržité „řeči"
+        signal.extend(sine(65_000, 0.25)); // 65 s of continuous "speech"
         let utts = feed(&mut vad, &signal, &mut t);
         assert!(utts.len() >= 2, "65 s řeči se má rozdělit, mám {}", utts.len());
         for u in &utts {
             let ms = u.samples.len() * 1000 / SAMPLE_RATE;
             assert!(ms <= 28_500, "kus {ms} ms přesahuje max okno");
         }
-        // zbytek doteče při flush
+        // the remainder arrives via flush
         assert!(vad.flush(2_000_000).is_some());
     }
 
@@ -297,7 +324,7 @@ mod tests {
         let mut vad = Vad::new(cfg());
         let mut t = 0;
         let mut all = Vec::new();
-        // amplituda šumu roste 60→600 během 60 s — dno musí stíhat
+        // noise amplitude rises 60→600 over 60 s — the floor must keep up
         let mut seed = 11;
         for step in 0..60 {
             all.extend(noise(1000, 60 + step * 9, &mut seed));
@@ -312,7 +339,7 @@ mod tests {
         let mut t = 0;
         let mut seed = 5;
         feed(&mut vad, &noise(1000, 60, &mut seed), &mut t);
-        feed(&mut vad, &sine(500, 0.25), &mut t); // řeč běží, neukončená
+        feed(&mut vad, &sine(500, 0.25), &mut t); // speech running, not yet ended
         vad.reset();
         assert!(vad.flush(1_000_100).is_none(), "po resetu nesmí nic zbýt");
     }

@@ -7,10 +7,10 @@ pub struct Segment {
     pub wm_class: String,
     pub title: String,
     pub start: i64,
-    /// exkluzivní konec = ts posledního vzorku + meta_interval
+    /// exclusive end = ts of the last sample + meta_interval
     pub end: i64,
     pub samples: usize,
-    /// (ts, relativní cesta) screenshotů pořízených během segmentu
+    /// (ts, relative path) of screenshots taken during the segment
     pub shots: Vec<(i64, String)>,
 }
 
@@ -20,8 +20,8 @@ impl Segment {
     }
 }
 
-/// Souvislé bloky stejné aktivity (třída okna + normalizovaný titulek).
-/// Idle vzorky se přeskakují; díra > 3× interval segment ukončí (suspend, výpadek).
+/// Contiguous blocks of the same activity (window class + normalized title).
+/// Idle samples are skipped; a gap > 3× the interval ends the segment (suspend, outage).
 pub fn segment(samples: &[Sample], meta_interval_s: i64, idle_threshold_ms: i64) -> Vec<Segment> {
     let gap = meta_interval_s * 3;
     let mut out: Vec<Segment> = Vec::new();
@@ -52,13 +52,13 @@ pub fn segment(samples: &[Sample], meta_interval_s: i64, idle_threshold_ms: i64)
     out
 }
 
-/// Normalizace titulku: pryč markery změn ("● ", "* "), sjednocené mezery.
+/// Title normalization: strip change markers ("● ", "* "), collapse whitespace.
 pub fn normalize_title(t: &str) -> String {
     let t = t.trim().trim_start_matches("● ").trim_start_matches("* ");
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Chronologická časová osa pro prompt; při překročení max_lines vezme nejdelší segmenty.
+/// Chronological timeline for the prompt; above max_lines, keeps the longest segments.
 pub fn render_timeline(segments: &[Segment], max_lines: usize) -> String {
     let mut segs: Vec<&Segment> = segments.iter().collect();
     if segs.len() > max_lines {
@@ -81,7 +81,7 @@ pub fn render_timeline(segments: &[Segment], max_lines: usize) -> String {
         .join("\n")
 }
 
-/// Součet aktivních sekund podle třídy okna, sestupně.
+/// Sum of active seconds by window class, descending.
 pub fn seconds_by_class(segments: &[Segment]) -> Vec<(String, i64)> {
     let mut map: HashMap<&str, i64> = HashMap::new();
     for s in segments {
@@ -127,7 +127,7 @@ mod tests {
         let samples = vec![
             sample(0, "firefox", "Docs", 0, None),
             sample(10, "firefox", "Docs", 0, None),
-            // díra 100 s (> 3×10)
+            // gap of 100 s (> 3×10)
             sample(110, "firefox", "Docs", 0, None),
         ];
         let segs = segment(&samples, 10, 120_000);
@@ -142,7 +142,7 @@ mod tests {
             sample(20, "firefox", "Docs", 0, None),
         ];
         let segs = segment(&samples, 10, 120_000);
-        // idle vzorek vypadl, ale díra 20 s <= 30 s → stále jeden segment
+        // idle sample dropped, but the 20 s gap <= 30 s → still one segment
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].samples, 2);
     }

@@ -13,7 +13,7 @@ pub struct X11 {
     height: u16,
     lsb: bool,
     has_screensaver: bool,
-    /// (depth, bits_per_pixel) ze setupu — pro správnou interpretaci GetImage
+    /// (depth, bits_per_pixel) from setup — for correctly interpreting GetImage
     pixmap_formats: Vec<(u8, u8)>,
     atom_net_active_window: Atom,
     atom_net_wm_name: Atom,
@@ -77,8 +77,9 @@ impl X11 {
         self.has_screensaver
     }
 
-    /// Levný round-trip, který propaguje chybu spojení — metadata dotazy chyby
-    /// maskují (okno může legitimně zmizet), tohle odhalí mrtvé spojení hned.
+    /// Cheap round-trip that surfaces connection errors — metadata queries
+    /// mask errors (a window can legitimately disappear), this catches a
+    /// dead connection right away.
     pub fn probe(&self) -> Result<()> {
         self.conn
             .get_input_focus()
@@ -88,7 +89,7 @@ impl X11 {
         Ok(())
     }
 
-    /// ms od posledního vstupu uživatele; 0 pokud nelze zjistit.
+    /// ms since the last user input; 0 if it can't be determined.
     pub fn idle_ms(&self) -> u64 {
         if !self.has_screensaver {
             return 0;
@@ -101,9 +102,9 @@ impl X11 {
             .unwrap_or(0)
     }
 
-    /// Metadata aktivního okna. Chyby (okno zmizelo apod.) vrací prázdné hodnoty,
-    /// ne Err — fatální je jen ztráta spojení, kterou zachytí volání capture_screen
-    /// nebo intern v connect().
+    /// Active window metadata. Errors (window disappeared, etc.) return
+    /// empty values, not Err — only a lost connection is fatal, and that's
+    /// caught by capture_screen or intern in connect().
     pub fn active_window_info(&self) -> WindowInfo {
         let desktop = self.get_cardinal(self.root, self.atom_net_current_desktop);
         let win = self
@@ -133,9 +134,20 @@ impl X11 {
         x11util::window_class(&self.conn, win)
     }
 
-    /// Celý root (u jednoho monitoru = celá obrazovka) jako RGB.
+    /// The full root window (with one monitor = the whole screen) as RGB.
     pub fn capture_screen(&self) -> Result<RgbImage> {
-        let (w, h) = (self.width, self.height);
+        // root dimensions are read live: resolution changes at runtime
+        // (monitor hotplug, xrandr). A cache from `connect()` would, after
+        // the root grows, leave GetImage requesting only the original
+        // (smaller) region — still inside the new root, so it wouldn't
+        // error, just silently crop the shot. GetGeometry = 1 roundtrip/frame.
+        let geom = self
+            .conn
+            .get_geometry(self.root)
+            .context("GetGeometry request selhal")?
+            .reply()
+            .context("GetGeometry reply selhal")?;
+        let (w, h) = (geom.width, geom.height);
         let reply = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, u32::MAX)

@@ -1,9 +1,9 @@
 use crate::pipeline::segment::Segment;
 use std::path::Path;
 
-/// Reprezentativní snímky: segmenty seřazené podle délky, z každého prostřední
-/// screenshot, dokud není dosažen strop. Vrací cesty relativní k data_dir
-/// (jen existující soubory).
+/// Representative frames: segments sorted by duration, taking the middle
+/// screenshot from each until the cap is reached. Returns paths relative to data_dir
+/// (existing files only).
 pub fn select_frames(segments: &[Segment], data_dir: &Path, cap: usize) -> Vec<String> {
     let mut ordered: Vec<&Segment> = segments.iter().filter(|s| !s.shots.is_empty()).collect();
     ordered.sort_by_key(|s| std::cmp::Reverse(s.duration_s()));
@@ -51,7 +51,7 @@ mod tests {
             seg(10, &[]),
         ];
         let frames = select_frames(&segments, &tmp, 2);
-        // nejdelší (b) první, missing přeskočen, cap 2 → b + a
+        // longest (b) first, missing skipped, cap 2 → b + a
         assert_eq!(frames, vec!["shots/b.jpg".to_string(), "shots/a.jpg".to_string()]);
         std::fs::remove_dir_all(&tmp).unwrap();
     }

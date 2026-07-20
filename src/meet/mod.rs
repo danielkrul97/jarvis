@@ -1,15 +1,15 @@
-//! `jarvis meet <URL>` — Jarvis se připojí do Google Meet jako samostatný
-//! hlasový účastník (architektura B1):
+//! `jarvis meet <URL>` — Jarvis joins a Google Meet call as a standalone
+//! voice participant (architecture B1):
 //!
 //! ```text
 //! Jarvis TTS ─► mic_sink ─.monitor─► remap mic_source ─► Chrome (Meet uplink)
 //! Meet downlink ─► Chrome ─► ear_sink ─.monitor─► whisper STT ─► converse
 //! ```
 //!
-//! Orchestrace: virtuální audio → dedikovaný Chrome → vizuální připojení →
-//! obousměrný audio bridge (reuse `listen` + `converse`, jen s přesměrovaným
-//! zařízením a sinkem) → po odchodu shrnutí schůzky. Zdroj i Chrome se uklidí
-//! i při pádu (Drop guardy).
+//! Orchestration: virtual audio → dedicated Chrome → visual join →
+//! bidirectional audio bridge (reuses `listen` + `converse`, just pointed at
+//! the redirected device/sink) → post-call summary. Both audio and Chrome
+//! clean up on crash too (Drop guards).
 
 pub mod audio;
 pub mod browser;
@@ -22,20 +22,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Nastaví se ze signálu (Ctrl-C / SIGTERM) i z hlídače Chrome; bridge ho čte.
+/// Set from a signal (Ctrl-C / SIGTERM) or the Chrome watcher; the bridge reads it.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Klon configu přesměrovaný na virtuální zařízení hovoru + zapnutá konverzace.
+/// Config clone redirected to the call's virtual devices, with conversation enabled.
 fn meet_config(cfg: &Config, va: &audio::VirtualAudio) -> Config {
     let mut m = cfg.clone();
     m.listen.enabled = true;
-    m.listen.device = va.ear_monitor(); // Jarvis slyší ostatní účastníky
-    m.speak.sink = va.mic_sink().to_string(); // Jarvisova řeč jde do hovoru
-    m.converse.enabled = true; // wake-word odpovědi do hovoru
+    m.listen.device = va.ear_monitor(); // Jarvis hears the other participants
+    m.speak.sink = va.mic_sink().to_string(); // Jarvis's speech goes into the call
+    m.converse.enabled = true; // wake-word replies into the call
     m
 }
 
@@ -48,20 +48,21 @@ pub fn run_meet(paths: &Paths, cfg: &Config, url: &str) -> Result<()> {
     }
     let session_start = util::now_ts();
 
-    // 1) virtuální audio (Drop uklidí i při pádu níž)
+    // 1) virtual audio (Drop cleans up below, even on crash)
     let va = audio::VirtualAudio::ensure(&cfg.meet.mic_sink, &cfg.meet.mic_source, &cfg.meet.ear_sink)
         .context("příprava virtuálního audia selhala")?;
 
-    // 2)+3) dedikovaný Chrome + vizuální připojení do hovoru.
-    // JARVIS_MEET_NO_BROWSER = neřídit prohlížeč (audio bridge na už běžící
-    // hovor / testování); jinak Jarvis spustí vlastní Chrome a připojí se sám.
+    // 2)+3) dedicated Chrome + visual join to the call.
+    // JARVIS_MEET_NO_BROWSER = don't manage the browser (audio bridge onto
+    // an already-running call / testing); otherwise Jarvis launches its own
+    // Chrome and joins itself.
     let manage_browser = std::env::var_os("JARVIS_MEET_NO_BROWSER").is_none();
     let mut chrome: Option<browser::Chrome> = if manage_browser {
         let chrome = browser::launch(paths, cfg, url, va.mic_source(), va.ear_sink())
             .context("spuštění Chrome selhalo")?;
         let jr = browser::join(paths, cfg).context("připojení do hovoru selhalo")?;
         if !jr.joined {
-            bail!("nepřipojil jsem se do hovoru: {}", jr.note); // chrome se zabije přes Drop
+            bail!("nepřipojil jsem se do hovoru: {}", jr.note); // chrome gets killed via Drop
         }
         info!("✅ v hovoru: {}", jr.note);
         Some(chrome)
@@ -70,18 +71,18 @@ pub fn run_meet(paths: &Paths, cfg: &Config, url: &str) -> Result<()> {
         None
     };
 
-    // 4) bridge: reuse listen (STT z ear monitoru) + converse (odpovědi do mic sinku)
+    // 4) bridge: reuse listen (STT from ear monitor) + converse (replies into mic sink)
     let mcfg = meet_config(cfg, &va);
     STOP.store(false, Ordering::SeqCst);
-    // Ctrl-C / SIGTERM → korektní odchod (shrnutí + úklid), ne tvrdé zabití
+    // Ctrl-C / SIGTERM → graceful exit (summary + cleanup), not a hard kill
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        // zápis do mrtvého warm-claude procesu nesmí zabít démona
+        // writing to a dead warm-claude process must not kill the daemon
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // pozdrav do hovoru (a zároveň okamžitý self-check cesty TTS → mikrofon)
+    // greet the call (also an immediate self-check of the TTS → mic path)
     let _ = crate::speak::say(
         paths,
         &mcfg,
@@ -94,7 +95,7 @@ pub fn run_meet(paths: &Paths, cfg: &Config, url: &str) -> Result<()> {
     info!("bridge běží — Ctrl-C nebo zavření okna ukončí hovor");
     let bridge_res: Result<()> = std::thread::scope(|s| {
         let bridge = s.spawn(|| listen::run_listen_ex(paths, &mcfg, false, "meet", Some(&STOP)));
-        // hlavní vlákno hlídá stav: signál / zavřený Chrome / konec bridge
+        // main thread watches state: signal / Chrome closed / bridge finished
         loop {
             if STOP.load(Ordering::SeqCst) {
                 break;
@@ -111,31 +112,39 @@ pub fn run_meet(paths: &Paths, cfg: &Config, url: &str) -> Result<()> {
             }
             std::thread::sleep(Duration::from_secs(2));
         }
-        STOP.store(true, Ordering::SeqCst); // ať bridge dojede, i když skončil Chrome
+        STOP.store(true, Ordering::SeqCst); // let the bridge finish even if Chrome already exited
         bridge.join().map_err(|_| anyhow::anyhow!("bridge vlákno spadlo (panic)"))?
     });
     if let Err(e) = &bridge_res {
         warn!("bridge skončil chybou: {e:#}");
     }
 
-    // 5) odchod z hovoru + úklid (chrome kill přes Drop; audio přes Drop)
+    // clear the call heartbeat right away → the ambient mic daemon wakes up
+    // without waiting for the TTL (the TTL fallback still covers crashes).
+    // We never held listen.lock (meet has its own meet.lock), so the mic
+    // service stayed alive the whole time, just muted.
+    if let Ok(conn) = db::open(&paths.db_path) {
+        let _ = db::state_del(&conn, listen::MEET_ACTIVE_KEY);
+    }
+
+    // 5) leave the call + cleanup (chrome killed via Drop; audio via Drop)
     if let Some(c) = chrome.as_mut() {
         c.kill();
     }
     info!("odešel jsem z hovoru");
 
-    // 6) poshovorové shrnutí
+    // 6) post-call summary
     if cfg.meet.summary && cfg.meet.summary_to != "none" {
         if let Err(e) = summarize_and_deliver(paths, cfg, session_start) {
             warn!("shrnutí schůzky selhalo: {e:#}");
         }
     }
-    drop(va); // explicitní teardown zařízení (jinak by proběhl na konci scope)
+    drop(va); // explicit device teardown (would otherwise happen at end of scope)
     bridge_res
 }
 
-/// Sestaví přepis hovoru (utterances source=meet od začátku session), nechá
-/// Claude vygenerovat shrnutí a rozešle ho dle `meet.summary_to`.
+/// Builds the call transcript (utterances source=meet since session start),
+/// has Claude generate a summary, and sends it per `meet.summary_to`.
 fn summarize_and_deliver(paths: &Paths, cfg: &Config, session_start: i64) -> Result<()> {
     let conn = db::open(&paths.db_path)?;
     let rows = db::utterances_between(&conn, session_start, util::now_ts() + 1)?;
@@ -143,16 +152,16 @@ fn summarize_and_deliver(paths: &Paths, cfg: &Config, session_start: i64) -> Res
         info!("žádný přepis hovoru — shrnutí přeskočeno");
         return Ok(());
     }
-    // přepis s časovými značkami; strop na délku promptu
+    // timestamped transcript; capped for prompt length
     let mut transcript = String::new();
     for r in &rows {
         transcript.push_str(&format!("[{}] {}\n", util::fmt_hm(r.ts_start), r.text.trim()));
     }
     const MAX: usize = 20_000;
     if transcript.len() > MAX {
-        // posuň řez na nejbližší hranici znaku — bajtový offset by jinak padl
-        // doprostřed vícebajtového UTF-8 znaku (český přepis je jich plný)
-        // a `&transcript[cut..]` by panikl
+        // shift the cut to the nearest char boundary — a raw byte offset
+        // could land inside a multi-byte UTF-8 char (Czech transcripts are
+        // full of them) and `&transcript[cut..]` would panic
         let mut cut = transcript.len() - MAX;
         while !transcript.is_char_boundary(cut) {
             cut += 1;
@@ -181,7 +190,7 @@ fn summarize_and_deliver(paths: &Paths, cfg: &Config, session_start: i64) -> Res
     if markdown.is_empty() {
         bail!("Claude vrátil prázdné shrnutí");
     }
-    // eviduj útratu
+    // record the spend
     let _ = db::insert_cost(
         &conn,
         util::now_ts(),

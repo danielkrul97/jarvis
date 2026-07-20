@@ -13,8 +13,8 @@ pub fn markdown_to_html(md: &str) -> String {
     out
 }
 
-/// E-mailové klienty spolehlivě stylují jen inline styly — dosadíme je do tagů
-/// vygenerovaných z Markdownu.
+/// Email clients reliably style only inline styles — we splice them into the
+/// tags generated from Markdown.
 fn inline_styles(html: &str) -> String {
     const MAP: [(&str, &str); 10] = [
         ("<h1>", "<h1 style=\"font-size:22px;margin:0 0 14px;color:#111;\">"),
@@ -35,7 +35,7 @@ fn inline_styles(html: &str) -> String {
     out
 }
 
-/// Celý e-mail: Markdown → HTML → inline styly → šablona.
+/// The full email: Markdown → HTML → inline styles → template.
 pub fn render_email(md: &str, date: NaiveDate) -> String {
     let body = inline_styles(&markdown_to_html(md));
     TEMPLATE

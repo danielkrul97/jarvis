@@ -20,27 +20,220 @@ pub struct Config {
     pub meet: MeetCfg,
     pub sms: SmsCfg,
     pub runbooks: RunbooksCfg,
+    pub memory: MemoryCfg,
+    pub proactive: ProactiveCfg,
+    pub tasks: TasksCfg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TasksCfg {
+    /// Scheduled internal jobs (`jarvis tasks`): Jarvis manages its own
+    /// housekeeping — dependency checks (binaries, models, keys, disk),
+    /// DB maintenance, screenshot cleanup. Unlike runbooks these aren't
+    /// user scripts (no approval needed): built-in, trusted functions run
+    /// on a schedule. Disabled = `tasks run-due` and the `jarvis run` loop
+    /// schedule nothing; manual `jarvis tasks run <name>` still works.
+    pub enabled: bool,
+    /// When a scheduled task finds a problem (missing dependency, low disk
+    /// space) it reports to Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    /// in secrets.env) so you learn about broken dependencies away from your
+    /// desk too. No keys = logged only. Safety invariant: the task only
+    /// INFORMS, never installs or changes the system itself — the remediation
+    /// command is included in the message.
+    pub notify_telegram: bool,
+    /// Truncate stored run output (DB shouldn't hold megabytes of logs).
+    pub max_output_chars: usize,
+    /// Dependency check (`deps`) warns when `data_dir` has less than this
+    /// many MB free (models and screenshots grow; a full disk breaks capture
+    /// and STT).
+    pub min_disk_free_mb: u64,
+}
+
+impl Default for TasksCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            notify_telegram: false,
+            max_output_chars: 4000,
+            min_disk_free_mb: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryCfg {
+    /// Long-term memory: hybrid search over past conversations/utterances
+    /// (FTS5 on `conversations`/`utterances`) adds relevant snippets from
+    /// the past to the conversation prompt — not just the last few exchanges
+    /// by recency. false = falls back to pure recency behavior.
+    pub enabled: bool,
+    /// Gap (s) that ends a "session": follow-up context (last
+    /// `converse.max_context_exchanges` exchanges) is only pulled into the
+    /// prompt while the gap between exchanges stays under this — so mornings
+    /// don't start with the tail of last night's conversation. 0 = no limit
+    /// (previous behavior).
+    pub session_gap_s: u64,
+    /// How many relevant past snippets to retrieve and add to the prompt
+    /// (on top of follow-up context). 0 = retrieval disabled (recency only).
+    pub retrieve_k: usize,
+    /// Length cap per attached snippet (chars) — bounds context tokens.
+    pub snippet_max_chars: usize,
+    /// Phase 2: nightly consolidation — `claude -p` extracts PERSISTENT facts
+    /// about the user from the day's conversations/utterances (preferences,
+    /// relationships, recurring tasks, profile) and stores them in semantic
+    /// memory (`memory_facts`). false = facts are only added manually
+    /// (`jarvis memory add`).
+    pub consolidate: bool,
+    /// Consolidation runs in the `jarvis run` loop after this local hour
+    /// (once a day) — a quiet slot so it doesn't delay dialog or analysis.
+    pub consolidate_hour: u8,
+    /// Model for fact extraction (cheap is fine — it's text summarization).
+    pub consolidate_model: String,
+    /// How many facts (pinned profile + relevant retrieved) get added to the
+    /// conversation prompt. 0 = no facts added to the prompt.
+    pub facts_in_prompt: usize,
+    /// Half-life of fact importance (days): older UNpinned facts lose
+    /// salience and get pruned below threshold. 0 = no decay (facts live
+    /// forever).
+    pub fact_half_life_days: u64,
+    /// Phase 3: dense vector embeddings (local e5 model via onnxruntime) +
+    /// fusion with FTS5 (RRF). Catches synonyms/paraphrases the lexical
+    /// layer misses. Activated once the index is populated: `jarvis memory
+    /// embed`. Without embeddings (or without onnxruntime), retrieval
+    /// silently falls back to FTS only.
+    pub vectors: bool,
+    /// Embedding model name (multilingual-e5-small = 384 dim, Czech OK).
+    /// Used to name the model folder and tag `embeddings.model`.
+    pub embed_model: String,
+    /// Path to `libonnxruntime.so` (ort load-dynamic). Empty = autodetect
+    /// (ORT_DYLIB_PATH env, then pip onnxruntime in ~/.local). Reuses the
+    /// existing CPU onnxruntime — nothing extra downloaded or compiled.
+    pub onnxruntime_lib: String,
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            session_gap_s: 1800,
+            retrieve_k: 4,
+            snippet_max_chars: 200,
+            consolidate: true,
+            consolidate_hour: 4,
+            consolidate_model: "claude-haiku-4-5-20251001".into(),
+            facts_in_prompt: 8,
+            fact_half_life_days: 60,
+            vectors: true,
+            embed_model: "multilingual-e5-small".into(),
+            onnxruntime_lib: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProactiveCfg {
+    /// Proactive layer ("nervous system"): from observations (patterns,
+    /// runbook runs, utterances) Jarvis offers timely action on its own —
+    /// out loud if you're at the desk, otherwise via Telegram. Biased toward
+    /// silence: better to stay quiet than interrupt. false = Jarvis stays
+    /// purely reactive (only responds to wake address). Safety invariant:
+    /// a nudge NEVER runs anything unapproved — it may only inform, offer to
+    /// run an ALREADY approved runbook, or offer to generate a proposal
+    /// (which still goes through the existing approval flow).
+    pub enabled: bool,
+    /// How often (s) the nudge loop in `jarvis run` evaluates the situation.
+    pub tick_s: u64,
+    /// Quiet hours [from, to) local time when Jarvis doesn't interrupt
+    /// (wraps past midnight when from > to). from == to = no quiet window.
+    pub quiet_from: u8,
+    pub quiet_to: u8,
+    /// Hard cap on nudges per day (across all detectors) — a safeguard
+    /// against nagging. 0 = nudge effectively disabled.
+    pub daily_max: u32,
+    /// Minimum gap (min) between nudges of the same kind and subject (dedup
+    /// key) — something already offered isn't repeated right away.
+    pub cooldown_min: u64,
+    /// Idle (s) below this threshold = you're at the desk → nudge out loud;
+    /// above threshold (or no fresh sample) → Telegram, if enabled.
+    pub at_desk_idle_s: u64,
+    /// Model for the skeptical classifier (Tier 2 gate: worth interrupting
+    /// now?).
+    pub model: String,
+    /// Both the classifier and actions respect the daily cap
+    /// (analysis.daily_budget_usd). false = the cap doesn't stop nudges
+    /// (spend is still tracked).
+    pub respect_budget: bool,
+    /// Detector: a pattern crossed its occurrence threshold and has no
+    /// proposal yet → offer to generate an automation. Deterministic, no
+    /// classifier.
+    pub detect_pattern_ready: bool,
+    /// Minimum occurrence count for a pattern to be worth offering.
+    pub pattern_min_occurrences: i64,
+    /// Detector: an approved runbook keeps failing → offer to show the
+    /// log/disable it. Deterministic, no classifier.
+    pub detect_runbook_failing: bool,
+    /// How many consecutive runbook runs must fail before it speaks up.
+    pub runbook_fail_streak: usize,
+    /// Detector: an utterance contained an open commitment ("I'll send…",
+    /// "I'll write…") → remind after a while. Coarse local filter, confirmed
+    /// by the classifier. Experimental: enable only after the kill-gate
+    /// (`jarvis nudge-eval`).
+    pub detect_commitment: bool,
+    /// Remote confirmation: a nudge sent to Telegram carries an action, and
+    /// "yes N" / "no N" from a verified chat executes/discards it (reuses
+    /// the approval loop). In v1 a voice nudge is informational only (you
+    /// state the action in dialog).
+    pub telegram_confirm: bool,
+}
+
+impl Default for ProactiveCfg {
+    fn default() -> Self {
+        Self {
+            // ship dark: enabled manually only after the kill-gate is verified
+            enabled: false,
+            tick_s: 120,
+            quiet_from: 22,
+            quiet_to: 8,
+            daily_max: 8,
+            cooldown_min: 90,
+            at_desk_idle_s: 120,
+            model: "claude-haiku-4-5-20251001".into(),
+            respect_budget: true,
+            // deterministic detectors: safe to enable right away
+            detect_pattern_ready: true,
+            pattern_min_occurrences: 3,
+            detect_runbook_failing: true,
+            runbook_fail_streak: 2,
+            // needs classifier + kill-gate → disabled by default
+            detect_commitment: false,
+            telegram_confirm: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunbooksCfg {
-    /// Fáze D: spouštění schválených runbooků (timer/hlas/CLI). Vypnuto =
-    /// run-due nic nespouští a hlasový agent runbooky nevidí; schvalování
-    /// a CLI `jarvis runbook run` fungují dál.
+    /// Phase D: running approved runbooks (timer/voice/CLI). Disabled =
+    /// run-due runs nothing and the voice agent doesn't see runbooks;
+    /// approval and CLI `jarvis runbook run` still work.
     pub enabled: bool,
-    /// Hlasový agent smí `jarvis runbook run` (jen už schválené runbooky;
-    /// schvalovat hlasem nejde nikdy — mikrofonu se nevěří).
+    /// Voice agent may `jarvis runbook run` (only already-approved runbooks;
+    /// approving by voice is never allowed — the mic isn't trusted).
     pub voice_run: bool,
-    /// Tvrdý strop běhu skriptu; po vypršení SIGKILL celé process group.
+    /// Hard cap on script runtime; SIGKILLs the whole process group on
+    /// expiry.
     pub timeout_s: u64,
-    /// Ořez uloženého výstupu běhu (DB nemá držet megabajty logů).
+    /// Truncate stored run output (DB shouldn't hold megabytes of logs).
     pub max_output_chars: usize,
-    /// Nový návrh automatizace ohlásit SMS (vyžaduje zapnuté [sms]).
+    /// Report new automation proposals via SMS (requires [sms] enabled).
     pub notify_sms: bool,
-    /// Schvalování na dálku přes Telegram bot (TELEGRAM_BOT_TOKEN +
-    /// TELEGRAM_CHAT_ID v secrets.env); run-due vyřizuje „schval N“ /
-    /// „zamítni N“ z ověřeného chatu a nové návrhy tam ohlašuje.
+    /// Remote approval via Telegram bot (TELEGRAM_BOT_TOKEN +
+    /// TELEGRAM_CHAT_ID in secrets.env); run-due handles "approve N" /
+    /// "reject N" from a verified chat and reports new proposals there.
     pub telegram_approve: bool,
 }
 
@@ -60,14 +253,15 @@ impl Default for RunbooksCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmsCfg {
-    /// SMS kanál (Twilio). Vypnuto = `jarvis sms` odmítne a agent SMS nevidí.
+    /// SMS channel (Twilio). Disabled = `jarvis sms` refuses and the agent
+    /// doesn't see SMS.
     pub enabled: bool,
-    /// Odesílatel: Messaging Service SID (`MG…`), E.164 číslo, nebo
-    /// alfanumerický sender (max 11 znaků; příjemce nemůže odpovědět).
+    /// Sender: Messaging Service SID (`MG…`), E.164 number, or an
+    /// alphanumeric sender (max 11 chars; recipient can't reply).
     pub from: String,
-    /// Výchozí příjemce v E.164 (+420…) — typicky vlastní mobil.
+    /// Default recipient in E.164 (+420…) — typically your own mobile.
     pub to: String,
-    /// Pojistka délky (SMS se účtují po segmentech ~70 znaků s diakritikou).
+    /// Length guard (SMS is billed per ~70-char segment with diacritics).
     pub max_chars: usize,
 }
 
@@ -80,15 +274,17 @@ impl Default for SmsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WmCfg {
-    /// Konverzační agent smí ovládat okna/klávesnici/myš (Bash omezený na
-    /// `jarvis wm …`). CLI `jarvis wm` funguje nezávisle na tomto přepínači.
+    /// Conversation agent may control windows/keyboard/mouse (Bash
+    /// restricted to `jarvis wm …`). CLI `jarvis wm` works independent of
+    /// this switch.
     pub enabled: bool,
-    /// Rozestup syntetických kláves (XTest) v ms.
+    /// Delay between synthetic keys (XTest), ms.
     pub key_delay_ms: u64,
-    /// Programy, které smí `jarvis wm spawn` spouštět mimo interaktivní
-    /// terminál (hlasový agent, timery). Porovnává se přesně: holé jméno
-    /// = binárka v PATH, absolutní cesta = konkrétní soubor. Prázdný
-    /// seznam = spawn mimo TTY odmítne všechno; z terminálu funguje vždy.
+    /// Programs `jarvis wm spawn` may launch outside an interactive
+    /// terminal (voice agent, timers). Matched exactly: a bare name = a
+    /// binary in PATH, an absolute path = a specific file. Empty list =
+    /// spawn outside a TTY refuses everything; from a terminal it always
+    /// works.
     pub spawn_allowed: Vec<String>,
 }
 
@@ -101,37 +297,40 @@ impl Default for WmCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeetCfg {
-    /// `jarvis meet <URL>` — Jarvis se připojí do Google Meet jako samostatný
-    /// účastník (vlastní Chrome, virtuální mikrofon + reproduktor). false =
-    /// příkaz odmítne běžet.
+    /// `jarvis meet <URL>` — Jarvis joins a Google Meet as an independent
+    /// participant (dedicated Chrome, virtual mic + speaker). false = the
+    /// command refuses to run.
     pub enabled: bool,
-    /// Binárka prohlížeče (jméno v PATH nebo absolutní cesta). Chrome/Chromium
-    /// (WebRTC + spolehlivý výběr audio zařízení přes PULSE_SINK/PULSE_SOURCE).
+    /// Browser binary (name in PATH or absolute path). Chrome/Chromium
+    /// (WebRTC + reliable audio device selection via PULSE_SINK/PULSE_SOURCE).
     pub chrome_bin: String,
-    /// Jméno, pod kterým Jarvis vystupuje v hovoru (vyplní se do pole „Your name").
+    /// Name Jarvis appears under in the call (fills the "Your name" field).
     pub display_name: String,
-    /// PulseAudio null-sink, do kterého míří Jarvisova řeč; jeho `.monitor`
-    /// přemapovaný na `mic_source` slouží jako mikrofon do hovoru.
+    /// PulseAudio null-sink that Jarvis's speech is routed to; its
+    /// `.monitor`, remapped to `mic_source`, serves as the mic into the call.
     pub mic_sink: String,
-    /// PulseAudio remap-source (z `mic_sink`.monitor) — tohle Chrome vybere
-    /// jako mikrofon (getUserMedia).
+    /// PulseAudio remap-source (from `mic_sink`.monitor) — what Chrome picks
+    /// as its microphone (getUserMedia).
     pub mic_source: String,
-    /// PulseAudio null-sink, kam Chrome hraje zvuk hovoru; jeho `.monitor`
-    /// poslouchá STT (Jarvis slyší ostatní účastníky).
+    /// PulseAudio null-sink that Chrome plays call audio into; its
+    /// `.monitor` is what STT listens on (Jarvis hears other participants).
     pub ear_sink: String,
-    /// Adresář profilu dedikovaného Chrome; prázdné = `<data_dir>/meet-profile`.
+    /// Dedicated Chrome profile directory; empty = `<data_dir>/meet-profile`.
     pub profile_dir: String,
-    /// Model pro vizuálního join-agenta (screenshot → klik). Prázdné = default CLI.
+    /// Model for the visual join agent (screenshot → click). Empty = CLI
+    /// default.
     pub join_model: String,
-    /// Strop, jak dlouho join-agent zkouší připojení (vč. čekání na admit), v s.
+    /// Cap on how long the join agent tries to connect (incl. waiting to be
+    /// admitted), in s.
     pub join_timeout_s: u64,
-    /// Strop kol vizuálního join-agenta (screenshot → akce → ověření).
+    /// Cap on visual join-agent turns (screenshot → action → verify).
     pub join_max_turns: u32,
-    /// Průběžně přepisovat celý hovor do DB (utterances, source=meet).
+    /// Continuously transcribe the whole call into the DB (utterances,
+    /// source=meet).
     pub transcribe: bool,
-    /// Po skončení hovoru vygenerovat a odeslat shrnutí schůzky.
+    /// Generate and send a meeting summary after the call ends.
     pub summary: bool,
-    /// Kam poslat shrnutí: "email" | "telegram" | "both" | "none".
+    /// Where to send the summary: "email" | "telegram" | "both" | "none".
     pub summary_to: String,
 }
 
@@ -262,41 +461,55 @@ impl Default for RetentionCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct ListenCfg {
     pub enabled: bool,
-    /// Když je aktivní zámek/šetřič obrazovky (XFCE screensaver, dotaz přes
-    /// D-Bus `org.xfce.ScreenSaver.GetActive`), mic démon zvuk zahazuje a nic
-    /// nepřepisuje — stejné soukromí jako `jarvis pause`. Netýká se `jarvis
-    /// meet` (hovor se přepisuje dál). Fail-open: nejde-li stav zjistit, běží.
+    /// When the screen lock/saver is active (XFCE screensaver, checked via
+    /// D-Bus `org.xfce.ScreenSaver.GetActive`), the mic daemon discards
+    /// audio and transcribes nothing — same privacy as `jarvis pause`.
+    /// Doesn't apply to `jarvis meet` (the call keeps transcribing). Fail
+    /// open: if state can't be determined, it runs.
     pub pause_when_locked: bool,
-    /// STT engine: "auto" = ElevenLabs Scribe (cloud), při chybě lokální
-    /// whisper; "elevenlabs" = jen Scribe, bez fallbacku; "whisper" = jen
-    /// lokálně (zdarma, nic neopouští stroj, ale náročné na CPU/GPU). V "auto"
-    /// se whisper model načítá až při prvním fallbacku (líně) — dokud Scribe
-    /// funguje, těžký model vůbec nezatíží stroj.
+    /// STT engine: "auto" = ElevenLabs Scribe (cloud), falls back to local
+    /// whisper on error; "elevenlabs" = Scribe only, no fallback; "whisper"
+    /// = local only (free, nothing leaves the machine, but CPU/GPU heavy).
+    /// In "auto" the whisper model loads lazily on first fallback — as long
+    /// as Scribe works, the heavy model never touches the machine.
     pub engine: String,
-    /// Model ElevenLabs Scribe: "scribe_v1" (stabilní, 99 jazyků vč. češtiny)
-    /// nebo "scribe_v2". Účtuje se po délce audia (~0,22 $/h).
+    /// ElevenLabs Scribe model: "scribe_v2" (newer, lowest WER — better
+    /// comprehension) or "scribe_v1". Billed by audio duration (~$0.22/h).
     pub scribe_model: String,
-    /// Keyterm biasing pro Scribe: vlastní jména, která má rozpoznat přesně
-    /// (bez toho slyší „Jarvisi" jako „Já vysí" a oslovení nezabere). Obdoba
-    /// whisperového `hint`. Prázdné = neposílat (+20 % k ceně, když vyplněné).
+    /// Keyterm biasing for Scribe: proper names it should recognize
+    /// accurately (without it, "Jarvisi" gets heard as garbage and the wake
+    /// address misses). Analogous to whisper's `hint`. Empty = don't send
+    /// (+20% cost when populated).
     pub scribe_keyterms: Vec<String>,
-    /// PulseAudio source (`pactl list sources short`); prázdné = výchozí mikrofon.
+    /// PulseAudio source (`pactl list sources short`); empty = default mic.
     pub device: String,
-    /// Název ggml modelu bez `ggml-`/`.bin` — stáhne `jarvis listen --download-model`.
+    /// Self-healing: shell command run when `device` is MISSING from
+    /// PulseAudio. Typically reloads `module-echo-cancel`, which breaks when
+    /// the USB mic disconnects on sleep (source_master disappears → so does
+    /// sink `jarvis_out` and source `jarvis_denoised` → listening goes silent
+    /// and `jarvis_out` is also missing for TTS). The listen loop calls the
+    /// command and tries to restore the source instead of waiting forever;
+    /// rate-limited to ~15s to avoid piling up duplicate modules. Empty =
+    /// disabled (previous behavior). Runs via `sh -c`, result only logged.
+    pub device_heal_cmd: String,
+    /// ggml model name without `ggml-`/`.bin` — downloaded by `jarvis listen
+    /// --download-model`.
     pub model: String,
-    /// Explicitní cesta k .bin souboru; přebíjí `model`.
+    /// Explicit path to the .bin file; overrides `model`.
     pub model_path: String,
-    /// "auto" = detekce jazyka per promluva, jinak ISO kód ("cs", "en", …).
+    /// "auto" = per-utterance language detection, otherwise an ISO code
+    /// ("cs", "en", …).
     pub language: String,
-    /// Slovníková nápověda whisperu (initial prompt) — vlastní jména,
-    /// která jinak komolí („Jarvisi" → „Jarysy"). Prázdné = bez nápovědy.
+    /// Whisper dictionary hint (initial prompt) — proper names it would
+    /// otherwise mangle ("Jarvisi" → garbage). Empty = no hint.
     pub hint: String,
-    /// 0 = auto (polovina jader, max 8).
+    /// 0 = auto (half the cores, max 8).
     pub threads: usize,
     pub min_speech_ms: u64,
     pub silence_ms: u64,
     pub max_utterance_s: u64,
-    /// Citlivost VAD: práh = šumové dno × tento násobek (menší = citlivější).
+    /// VAD sensitivity: threshold = noise floor × this multiplier (lower =
+    /// more sensitive).
     pub vad_speech_mult: f32,
 }
 
@@ -305,31 +518,38 @@ impl Default for ListenCfg {
         Self {
             enabled: true,
             pause_when_locked: true,
-            // Scribe je default: whisper turbo je na běžném CPU/GPU náročný
-            // (RTF 1–4 bez GPU), Scribe přesune přepis do cloudu za ~0,22 $/h.
-            // Bez ElevenLabs klíče "auto" tiše spadne na lokální whisper.
+            // Scribe is the default: whisper turbo is heavy on typical CPU/GPU
+            // (RTF 1-4 without GPU); Scribe moves transcription to the cloud
+            // at ~$0.22/h. Without an ElevenLabs key, "auto" silently falls
+            // back to local whisper.
             engine: "auto".into(),
-            scribe_model: "scribe_v1".into(),
+            // scribe_v2: newer Scribe with the lowest WER (better Czech comprehension)
+            scribe_model: "scribe_v2".into(),
             scribe_keyterms: vec!["Jarvis".into(), "Jarvisi".into()],
             device: String::new(),
-            // turbo na GPU (CUDA build): RTF ~0.2–0.6, nejlepší čeština.
-            // CPU fallback pro turbo nestíhá (RTF 1–4) — bez GPU přepni na
-            // "small-q5_1" (RTF ~0.2–0.8 na CPU). Viz PLAN §3.7 (2026-07-17).
+            device_heal_cmd: String::new(),
+            // turbo on GPU (CUDA build): RTF ~0.2-0.6, best Czech accuracy.
+            // CPU fallback for turbo can't keep up (RTF 1-4) — without a GPU
+            // switch to "small-q5_1" (RTF ~0.2-0.8 on CPU). See PLAN §3.7 (2026-07-17).
             model: "large-v3-turbo-q5_0".into(),
             model_path: String::new(),
-            // pinnutý jazyk: autodetekce stojí celý encode navíc (i na GPU
-            // zdvoj- až ztrojnásobí čas krátkých promluv)
+            // pinned language: autodetection costs a full extra encode pass
+            // (on GPU too — doubles to triples the time for short utterances)
             language: "cs".into(),
-            // jméno asistenta whisper nezná — bez nápovědy ho komolí.
-            // Slovníkový styl schválně: na šumu/hudbě whisper hint občas
-            // halucinuje do přepisu a věta znějící jako oslovení by falešně
-            // budila konverzaci (echo-guard viz converse::WakeWords).
+            // whisper doesn't know the assistant's name — mangles it without
+            // a hint. Dictionary style is deliberate: on noise/music whisper's
+            // hint sometimes hallucinates into the transcript, and a phrase
+            // that sounds like a wake address would falsely wake the
+            // conversation (echo-guard, see converse::WakeWords).
             hint: "Slovník: Jarvis, Jarvisi, ElevenLabs, digest.".into(),
             threads: 0,
             min_speech_ms: 300,
-            silence_ms: 700,
+            // 480: tradeoff between responsiveness and cutting off a sentence
+            // mid-breath (700 added ~220ms of dead time per turn). Below
+            // ~400 risks clipping.
+            silence_ms: 480,
             max_utterance_s: 28,
-            // 2.0: na tichém mikrofonu (SNR ~14 dB) násobek 3 sekal věty
+            // 2.0: on a quiet mic (SNR ~14 dB) a multiplier of 3 clipped sentences
             vad_speech_mult: 2.0,
         }
     }
@@ -349,44 +569,52 @@ impl ListenCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct SpeakCfg {
     pub enabled: bool,
-    /// "auto" = ElevenLabs, při chybě lokální piper; "piper" = jen lokálně
-    /// (zdarma, nic neopouští stroj); "elevenlabs" = jen API, bez fallbacku.
+    /// "auto" = ElevenLabs, falls back to local piper on error; "piper" =
+    /// local only (free, nothing leaves the machine); "elevenlabs" = API
+    /// only, no fallback.
     pub engine: String,
-    /// ElevenLabs voice_id. Premade hlasy fungují i se scoped klíčem
-    /// bez `voices_read`; hlasy z Voice Library je nutné nejdřív přidat
-    /// do účtu (web) a sem vložit jejich ID.
+    /// ElevenLabs voice_id. Premade voices work even with a scoped key
+    /// lacking `voices_read`; Voice Library voices must first be added to
+    /// the account (web) and their ID pasted here.
     pub voice_id: String,
     pub model_id: String,
-    /// ISO kód ("cs"); vynucení umí jen *_v2_5 modely, multilingual_v2
-    /// jazyk pozná z textu. "auto" = nikdy neposílat language_code.
+    /// ISO code ("cs"); only *_v2_5 models can force it, multilingual_v2
+    /// detects language from the text. "auto" = never send language_code.
     pub language: String,
-    /// Jen mp3_* — přehrávání i cache s kontejnerovým formátem počítají.
+    /// mp3_* only — both playback and the cache assume a container format.
     pub output_format: String,
-    /// 0–1; nižší = expresivnější přednes.
+    /// Stream ElevenLabs audio straight into the player (speech starts after
+    /// the first chunk, not the whole mp3) — one-shot replies only; ack/cache
+    /// still go through a file. Requires ffplay/mpv (stdin); otherwise/on
+    /// error → buffered.
+    pub stream: bool,
+    /// 0-1; lower = more expressive delivery.
     pub stability: f32,
-    /// 0–1; věrnost původnímu hlasu.
+    /// 0-1; fidelity to the original voice.
     pub similarity_boost: f32,
-    /// 0–1; u češtiny držet nízko, vyšší hodnoty deformují výslovnost.
+    /// 0-1; keep low for Czech — higher values distort pronunciation.
     pub style: f32,
     pub speaker_boost: bool,
-    /// 0.7–1.2; Brumbál nespěchá.
+    /// 0.7-1.2; Brumbál isn't in a hurry.
     pub speed: f32,
-    /// Přehrávač + argumenty; prázdné = auto (ffplay → mpv → ffmpeg+paplay).
+    /// Player binary + args; empty = auto (ffplay → mpv → ffmpeg+paplay).
     pub player: String,
-    /// PulseAudio sink pro Jarvisovu řeč. Nastavený na sink echo-cancel
-    /// modulu (sink_name v default.pa) dává AEC far-end referenci —
-    /// mikrofon pak Jarvisův hlas odečte a neslyší sám sebe. Prázdné =
-    /// výchozí výstup; neexistující sink = warn + výchozí výstup.
+    /// PulseAudio sink for Jarvis's speech. Set to the echo-cancel module's
+    /// sink (sink_name in default.pa) to give AEC a far-end reference — the
+    /// mic then subtracts Jarvis's own voice and doesn't hear itself. Empty
+    /// = default output; a nonexistent sink = warn + default output.
     pub sink: String,
-    /// Po odeslání denního digestu ho Jarvis ohlásí nahlas.
+    /// Announce the daily digest out loud after sending it.
     pub announce_digest: bool,
-    /// Stejný text se stejným nastavením se generuje jen jednou (kredity).
+    /// The same text with the same settings is only generated once (saves
+    /// credits).
     pub cache: bool,
-    /// Pojistka proti spálení kreditů: 1 znak = 1 kredit (multilingual_v2).
+    /// Guard against burning credits: 1 char = 1 credit (multilingual_v2).
     pub max_chars: usize,
-    /// Binárka lokálního TTS (`pip3 install --user piper-tts`).
+    /// Local TTS binary (`pip3 install --user piper-tts`).
     pub piper_bin: String,
-    /// Hlas z rhasspy/piper-voices; stáhne `jarvis say --download-model`.
+    /// Voice from rhasspy/piper-voices; downloaded by `jarvis say
+    /// --download-model`.
     pub piper_voice: String,
 }
 
@@ -395,14 +623,18 @@ impl Default for SpeakCfg {
         Self {
             enabled: true,
             engine: "auto".into(),
-            // „George" — premade, teplý hlubší britský vypravěč; přes
-            // multilingual_v2 mluví česky a z premade hlasů je Brumbálovi
-            // nejblíž. Vlastní volba: `jarvis say --list-voices` / web.
+            // "George" — premade, warm deeper British narrator; speaks Czech
+            // via multilingual_v2 and is the closest premade voice to
+            // Brumbál. To pick your own: `jarvis say --list-voices` / web.
             voice_id: "JBFqnCBsd6RMkjVDRZzb".into(),
-            // nejlepší čeština; rychlejší a levnější je eleven_flash_v2_5
-            model_id: "eleven_multilingual_v2".into(),
+            // flash_v2_5: an order of magnitude lower latency (critical path
+            // for every sentence) and can force language_code=cs (see
+            // tts::supports_language_code); the warmest/highest-quality
+            // Czech is eleven_multilingual_v2.
+            model_id: "eleven_flash_v2_5".into(),
             language: "cs".into(),
             output_format: "mp3_44100_128".into(),
+            stream: true,
             stability: 0.5,
             similarity_boost: 0.75,
             style: 0.0,
@@ -414,14 +646,15 @@ impl Default for SpeakCfg {
             cache: true,
             max_chars: 2500,
             piper_bin: "piper".into(),
-            // jediný kvalitní český hlas v piper-voices (mužský, medium)
+            // the only decent Czech voice in piper-voices (male, medium)
             piper_voice: "cs_CZ-jirka-medium".into(),
         }
     }
 }
 
-/// Deserializace, která přijme jeden řetězec i pole řetězců → Vec<String>
-/// (zpětná kompatibilita: `ack = "Ano, pane?"` i `ack = ["…", "…"]`).
+/// Deserializes either a single string or an array of strings into
+/// Vec<String> (backward compat: `ack = "Ano, pane?"` and `ack = ["…", "…"]`
+/// both work).
 fn string_or_seq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -438,57 +671,113 @@ fn string_or_seq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConverseCfg {
-    /// Hlasový dialog: promluva s oslovením → Claude → odpověď nahlas.
+    /// Voice dialog: an utterance with a wake address → Claude → spoken reply.
     pub enabled: bool,
-    /// Kmeny oslovení (case-insensitive, bez diakritiky a mezer). Vokativ
-    /// („jarvisi") netriggeruje řeč O projektu; volnější: přidej "jarvis".
+    /// Wake-address stems (case-insensitive, no diacritics/spaces). The
+    /// vocative ("jarvisi") doesn't trigger on speech ABOUT the project;
+    /// looser: add "jarvis".
     pub wake_words: Vec<String>,
-    /// Tolerance 1 editační chyby přepisu („Javi si" ≈ „Jarvisi"). Cena:
-    /// občas chytne i skloňované „jarvis" v běžné řeči.
+    /// Tolerates 1 transcription edit distance ("Javi si" ≈ "Jarvisi").
+    /// Cost: occasionally also catches inflected "jarvis" in ordinary speech.
     pub wake_fuzzy: bool,
-    /// Odpovídání bez wake-wordu (addressee detection). "off" = jen na
-    /// oslovení jménem (výchozí, dnešní chování). "followup" = po Jarvisově
-    /// odpovědi je krátké okno, kdy navazující promluva jméno nepotřebuje
-    /// (Tier 1). "always" = každou věrohodnou promluvu posoudí skeptický
-    /// klasifikátor, jestli mířila na Jarvise (Tier 2, experimentální — zapni
-    /// až po kill-gate, viz PLAN §3.9).
+    /// Responding without a wake word (addressee detection). "off" = only on
+    /// wake address by name (default, current behavior). "followup" = after
+    /// Jarvis speaks there's a short window where the next utterance doesn't
+    /// need the name (Tier 1). "always" = every plausible utterance is
+    /// judged by a skeptical classifier for whether it was addressed to
+    /// Jarvis (Tier 2, experimental — enable only after the kill-gate, see
+    /// PLAN §3.9).
     pub open_ear: String,
-    /// Jak dlouho po Jarvisově řeči drží follow-up okno (s). Krátké schválně:
-    /// čím delší, tím větší riziko skočení do řeči, když se mezitím otočíš
-    /// na člověka.
+    /// How long the follow-up window stays open after Jarvis speaks (s).
+    /// Deliberately short: the longer it is, the higher the risk of butting
+    /// in when you've turned to talk to a person instead.
     pub followup_window_s: u64,
-    /// Minimální počet slov promluvy bez wake-wordu, aby vůbec byla kandidátem
-    /// (odfiltruje „ehm", „jo" — ta se nemají posílat workerovi ani klasifikátoru).
+    /// Minimum word count for an utterance without a wake word to even be a
+    /// candidate (filters out "uh", "yeah" — those shouldn't go to the
+    /// worker or the classifier).
     pub open_ear_min_words: usize,
-    /// Model pro odpovědi; rychlost > síla (mluvený dialog).
+    /// Model for replies; speed > strength (spoken dialog).
     pub model: String,
-    /// Okamžitá reakce na oslovení, než Claude vymyslí odpověď; vybírá se z listu
-    /// náhodně kvůli pestrosti. Přijme i jediný řetězec. "" nebo [] = vypnuto.
+    /// Model for the skeptical gate (addressee classifier for open-ear and
+    /// follow-up): runs BEFORE the expensive `model`, on every candidate
+    /// without a wake-by-name, so it should be cheap and fast (haiku). Empty
+    /// = falls back to `model`.
+    pub gate_model: String,
+    /// Immediate reaction to a wake address while Claude composes the reply;
+    /// picked randomly from the list for variety. Accepts a single string
+    /// too. "" or [] = disabled.
     #[serde(deserialize_with = "string_or_seq")]
     pub ack: Vec<String>,
-    /// Kolik minulých výměn se přikládá pro navazující otázky.
+    /// How many past exchanges are attached for follow-up questions.
     pub max_context_exchanges: usize,
-    /// Strop kol agenta, když má povolené nástroje ([wm] enabled) — akce
-    /// s okny potřebují víc otoček (příkaz → screenshot → ověření). Bez
-    /// nástrojů se vždy používá 1.
+    /// Cap on agent turns when tools are enabled ([wm] enabled) — window
+    /// actions need more round trips (command → screenshot → verify).
+    /// Without tools it's always 1.
     pub max_turns: u32,
     pub timeout_s: u64,
-    /// false = denní strop (analysis.daily_budget_usd) konverzace neblokuje;
-    /// útrata se dál eviduje a je vidět ve `status` a digestu.
+    /// false = the daily cap (analysis.daily_budget_usd) doesn't block
+    /// conversation; spend is still tracked and visible in `status` and the
+    /// digest.
     pub respect_budget: bool,
-    /// Rezidentní claude proces (stream-json): odpověď bez CLI startu
-    /// (~2 s úspora). Při chybě automatický fallback na jednorázový spawn.
+    /// Resident claude process (stream-json): replies without a CLI startup
+    /// (~2s saved). Automatic fallback to a one-shot spawn on error.
     pub warm: bool,
-    /// Po tolika výměnách se proces recykluje — session akumuluje kontext
-    /// a input tokeny (cena) by rostly donekonečna.
+    /// The process is recycled after this many exchanges — the session
+    /// accumulates context and input tokens (cost) would otherwise grow
+    /// unbounded.
     pub warm_max_exchanges: usize,
-    /// Recyklace po nečinnosti (čerstvá session ráno místo včerejší).
+    /// Recycle after idle time (fresh session in the morning instead of
+    /// yesterday's).
     pub warm_idle_s: u64,
-    /// Konverzační agent smí hledat na webu (WebSearch/WebFetch) — aktuální
-    /// informace: počasí, zprávy, kurzy, cokoli po datu znalostí modelu.
-    /// Web search se účtuje přes Anthropic (~0,01 $/dotaz). false = mozek
-    /// jede jen z natrénovaných znalostí a aktuality přizná, že nemá.
+    /// Conversation agent may search the web (WebSearch/WebFetch) — current
+    /// info: weather, news, rates, anything past the model's knowledge
+    /// cutoff. Web search is billed through Anthropic (~$0.01/query). false
+    /// = the brain runs on trained knowledge only and admits when it lacks
+    /// current info.
     pub web: bool,
+    /// Barge-in: speak, and Jarvis stops talking. "Jarvisi …" always
+    /// interrupts (echo-safe). Interruption without a wake word (voice onset
+    /// during speech) only works with AEC — speak.sink set to an
+    /// echo-cancel sink; without it Jarvis would trip over its own echo, so
+    /// the silent variant is disabled. false = speech isn't interruptible.
+    pub barge_in: bool,
+    /// How many ms of continuous speech trigger acoustic barge-in (AEC
+    /// only). Lower = more responsive but more sensitive to short
+    /// noises/coughs.
+    pub barge_in_ms: u64,
+    /// Filler for long waits: once this many seconds have passed since the
+    /// ack and the first sentence of the reply still hasn't started
+    /// (typically an agentic wm/web action or a slow model), Jarvis inserts
+    /// a reassuring filler ("Ještě chvilku, pane…") and repeats it at the
+    /// same cadence until the reply starts. 0 = disabled. Cached phrases
+    /// (cheap); barge-in and the start of the reply both cut the filler off.
+    pub filler_after_s: u64,
+    /// Filler phrases (randomized, for variety). [] or filler_after_s=0 =
+    /// disabled.
+    #[serde(deserialize_with = "string_or_seq")]
+    pub filler: Vec<String>,
+    /// When a wake address isn't followed by a real question (just the name
+    /// / name + filler), Jarvis asks for a repeat and skips calling Claude
+    /// entirely (saves money and latency). Random from the list; [] = gate
+    /// disabled (noise goes to Claude as before).
+    #[serde(deserialize_with = "string_or_seq")]
+    pub reprompt: Vec<String>,
+    /// Reprompt only fires when the substantive word count after the wake
+    /// address is LESS than this (1 = only when nothing is left) — biased
+    /// toward NOT rejecting a real question.
+    pub reprompt_min_words: usize,
+    /// On the first exchange of a "session" (after a long gap / overnight),
+    /// Jarvis greets by time of day instead of the ack ("Dobré ráno,
+    /// pane."). false = always just the ack.
+    pub greeting: bool,
+    /// How long a gap since the last conversation triggers a greeting (s).
+    /// Default 4h.
+    pub greeting_gap_s: u64,
+    /// "Jarvisi dobrou noc" → Jarvis says goodbye and skips calling Claude.
+    /// Random from the list; [] = disabled. Only catches clear farewells,
+    /// not questions containing them.
+    #[serde(deserialize_with = "string_or_seq")]
+    pub farewell: Vec<String>,
 }
 
 impl Default for ConverseCfg {
@@ -497,10 +786,11 @@ impl Default for ConverseCfg {
             enabled: true,
             wake_words: vec!["jarvisi".into(), "jarvise".into()],
             wake_fuzzy: true,
-            open_ear: "off".into(),
+            open_ear: "followup".into(),
             followup_window_s: 12,
             open_ear_min_words: 2,
             model: "claude-haiku-4-5-20251001".into(),
+            gate_model: "claude-haiku-4-5-20251001".into(),
             ack: vec![
                 "Ano, pane?".into(),
                 "Poslouchám, pane.".into(),
@@ -520,6 +810,11 @@ impl Default for ConverseCfg {
                 "Zajisté, pane.".into(),
                 "Rád pomohu, pane.".into(),
                 "Vždy k službám, pane.".into(),
+                // interjections / shorter fillers — sometimes read more like "thinking"
+                "Hmm…".into(),
+                "Moment, pane…".into(),
+                "Vteřinku…".into(),
+                "Okamžik, dívám se…".into(),
             ],
             max_context_exchanges: 3,
             max_turns: 12,
@@ -529,6 +824,30 @@ impl Default for ConverseCfg {
             warm_max_exchanges: 10,
             warm_idle_s: 900,
             web: true,
+            barge_in: true,
+            barge_in_ms: 250,
+            filler_after_s: 7,
+            filler: vec![
+                "Ještě chvilku, pane…".into(),
+                "Okamžik, pane…".into(),
+                "Už na tom pracuji…".into(),
+                "Ještě moment…".into(),
+                "Hned to bude, pane…".into(),
+            ],
+            reprompt: vec![
+                "Promiňte, pane, nerozuměl jsem. Zopakujete to?".into(),
+                "Neslyšel jsem dobře, pane — ještě jednou, prosím?".into(),
+                "Ano, pane? Nezachytil jsem, co si přejete.".into(),
+                "Prosím, pane?".into(),
+            ],
+            reprompt_min_words: 1,
+            greeting: true,
+            greeting_gap_s: 14400, // 4h = "new session"
+            farewell: vec![
+                "Dobrou noc, pane. Odpočiňte si.".into(),
+                "Nashledanou, pane.".into(),
+                "Mějte se, pane.".into(),
+            ],
         }
     }
 }
@@ -557,17 +876,19 @@ impl Config {
         if self.capture.max_dimension < 256 {
             bail!("capture.max_dimension musí být >= 256");
         }
-        // `contains` je false i pro NaN/inf → jediná mez pokryje i je. Bez
-        // kontroly by záporný strop trvale blokoval AI (converse vrací jen
-        // BUDGET_REPLY, analýza jede degradovaně) a NaN by strop naopak vypnul.
+        // `contains` is false for NaN/inf too → a single range check covers
+        // them. Without this check, a negative cap would permanently block
+        // AI (converse only returns BUDGET_REPLY, analysis runs degraded)
+        // while NaN would instead disable the cap entirely.
         if !(0.0..=1000.0).contains(&self.analysis.daily_budget_usd) {
             bail!(
                 "analysis.daily_budget_usd musí být 0–1000 USD (konečné číslo), je {}",
                 self.analysis.daily_budget_usd
             );
         }
-        // 0 by v hodinovém úklidu smazalo úplně všechny snímky (cutoff = teď);
-        // horní mez drží `screenshots_days * 86400` mimo overflow i64.
+        // 0 would make the hourly cleanup delete all screenshots (cutoff =
+        // now); the upper bound keeps `screenshots_days * 86400` clear of i64
+        // overflow.
         if !(1..=3650).contains(&self.retention.screenshots_days) {
             bail!(
                 "retention.screenshots_days musí být 1–3650, je {}",
@@ -712,6 +1033,18 @@ impl Config {
         if !(1..=20).contains(&c.open_ear_min_words) {
             bail!("converse.open_ear_min_words musí být 1–20, je {}", c.open_ear_min_words);
         }
+        if !(60..=2000).contains(&c.barge_in_ms) {
+            bail!("converse.barge_in_ms musí být 60–2000, je {}", c.barge_in_ms);
+        }
+        if c.filler_after_s != 0 && !(3..=120).contains(&c.filler_after_s) {
+            bail!("converse.filler_after_s musí být 0 (vypnuto) nebo 3–120, je {}", c.filler_after_s);
+        }
+        if !(1..=5).contains(&c.reprompt_min_words) {
+            bail!("converse.reprompt_min_words musí být 1–5, je {}", c.reprompt_min_words);
+        }
+        if !(60..=86_400).contains(&c.greeting_gap_s) {
+            bail!("converse.greeting_gap_s musí být 60–86400, je {}", c.greeting_gap_s);
+        }
         if !(10..=600).contains(&c.timeout_s) {
             bail!("converse.timeout_s musí být 10–600, je {}", c.timeout_s);
         }
@@ -744,6 +1077,40 @@ impl Config {
         }
         if !(200..=100_000).contains(&rb.max_output_chars) {
             bail!("runbooks.max_output_chars musí být 200–100000, je {}", rb.max_output_chars);
+        }
+        let tk = &self.tasks;
+        if !(200..=100_000).contains(&tk.max_output_chars) {
+            bail!("tasks.max_output_chars musí být 200–100000, je {}", tk.max_output_chars);
+        }
+        if tk.min_disk_free_mb > 1_000_000 {
+            bail!("tasks.min_disk_free_mb musí být 0–1000000 (max ~1 TB), je {}", tk.min_disk_free_mb);
+        }
+        let mem = &self.memory;
+        if mem.retrieve_k > 50 {
+            bail!("memory.retrieve_k musí být 0–50, je {}", mem.retrieve_k);
+        }
+        if mem.session_gap_s > 86_400 {
+            bail!("memory.session_gap_s musí být 0–86400, je {}", mem.session_gap_s);
+        }
+        if !(20..=2000).contains(&mem.snippet_max_chars) {
+            bail!("memory.snippet_max_chars musí být 20–2000, je {}", mem.snippet_max_chars);
+        }
+        if mem.consolidate_hour > 23 {
+            bail!("memory.consolidate_hour musí být 0–23, je {}", mem.consolidate_hour);
+        }
+        if mem.consolidate_model.trim().is_empty() {
+            bail!("memory.consolidate_model nesmí být prázdný");
+        }
+        if mem.facts_in_prompt > 50 {
+            bail!("memory.facts_in_prompt musí být 0–50, je {}", mem.facts_in_prompt);
+        }
+        if mem.fact_half_life_days > 3650 {
+            bail!("memory.fact_half_life_days musí být 0–3650, je {}", mem.fact_half_life_days);
+        }
+        if mem.embed_model.is_empty()
+            || !mem.embed_model.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            bail!("memory.embed_model smí obsahovat jen [A-Za-z0-9._-], je '{}'", mem.embed_model);
         }
         let sm = &self.sms;
         if sm.enabled {
@@ -797,6 +1164,31 @@ impl Config {
             if !matches!(m.summary_to.as_str(), "email" | "telegram" | "both" | "none") {
                 bail!("meet.summary_to musí být email | telegram | both | none, je '{}'", m.summary_to);
             }
+        }
+        let pr = &self.proactive;
+        if !(20..=3600).contains(&pr.tick_s) {
+            bail!("proactive.tick_s musí být 20–3600, je {}", pr.tick_s);
+        }
+        if pr.quiet_from > 23 || pr.quiet_to > 23 {
+            bail!("proactive.quiet_from/quiet_to musí být 0–23 (je {}/{})", pr.quiet_from, pr.quiet_to);
+        }
+        if pr.daily_max > 100 {
+            bail!("proactive.daily_max musí být 0–100, je {}", pr.daily_max);
+        }
+        if pr.cooldown_min > 1440 {
+            bail!("proactive.cooldown_min musí být 0–1440 (max den), je {}", pr.cooldown_min);
+        }
+        if !(10..=3600).contains(&pr.at_desk_idle_s) {
+            bail!("proactive.at_desk_idle_s musí být 10–3600, je {}", pr.at_desk_idle_s);
+        }
+        if pr.model.trim().is_empty() {
+            bail!("proactive.model nesmí být prázdný");
+        }
+        if !(1..=1000).contains(&pr.pattern_min_occurrences) {
+            bail!("proactive.pattern_min_occurrences musí být 1–1000, je {}", pr.pattern_min_occurrences);
+        }
+        if !(1..=20).contains(&pr.runbook_fail_streak) {
+            bail!("proactive.runbook_fail_streak musí být 1–20, je {}", pr.runbook_fail_streak);
         }
         Blacklist::new(&self.capture)?;
         Ok(())
@@ -870,7 +1262,7 @@ impl Paths {
         ] {
             fs::create_dir_all(dir).with_context(|| format!("nelze vytvořit {}", dir.display()))?;
         }
-        // data i config drží citlivá data — jen pro uživatele
+        // both data and config hold sensitive data — user-only permissions
         for dir in [&self.config_dir, &self.data_dir] {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("nelze nastavit práva {}", dir.display()))?;
@@ -879,7 +1271,7 @@ impl Paths {
     }
 }
 
-/// Tajemství: env proměnná `name` má přednost, jinak řádek `name=…` v secrets.env.
+/// Secret lookup: env var `name` takes priority, else a `name=…` line in secrets.env.
 fn secret(paths: &Paths, name: &str) -> Result<String> {
     if let Ok(k) = std::env::var(name) {
         let k = k.trim().to_string();
@@ -919,17 +1311,17 @@ pub fn elevenlabs_key(paths: &Paths) -> Result<String> {
     secret(paths, "ELEVENLABS_API_KEY")
 }
 
-/// (account SID, auth token) pro Twilio SMS.
+/// (account SID, auth token) for Twilio SMS.
 pub fn twilio_keys(paths: &Paths) -> Result<(String, String)> {
     Ok((secret(paths, "TWILIO_ACCOUNT_SID")?, secret(paths, "TWILIO_AUTH_TOKEN")?))
 }
 
-/// (bot token, chat id) pro schvalování runbooků přes Telegram.
+/// (bot token, chat id) for approving runbooks via Telegram.
 pub fn telegram_keys(paths: &Paths) -> Result<(String, String)> {
     Ok((secret(paths, "TELEGRAM_BOT_TOKEN")?, secret(paths, "TELEGRAM_CHAT_ID")?))
 }
 
-/// Parsuje "30m", "2h", "7d", "45s" nebo holé sekundy na sekundy.
+/// Parses "30m", "2h", "7d", "45s", or bare seconds into seconds.
 pub fn parse_duration_spec(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -946,8 +1338,9 @@ pub fn parse_duration_spec(s: &str) -> Result<u64> {
     let n: u64 = num
         .parse()
         .with_context(|| format!("neplatné trvání '{s}'"))?;
-    // checked: absurdní vstup („1000000000000000d") by jinak přetekl u64
-    // (debug panika / release wrap → nesmyslná pauza, i záporná po `+ now_ts`)
+    // checked: an absurd input ("1000000000000000d") would otherwise
+    // overflow u64 (debug panic / release wraparound → a nonsense pause,
+    // even negative after `+ now_ts`)
     n.checked_mul(mult).with_context(|| format!("trvání '{s}' je mimo rozsah"))
 }
 
@@ -962,11 +1355,11 @@ mod tests {
 
     #[test]
     fn ack_accepts_string_or_list() {
-        // zpětná kompatibilita: jediný řetězec → jednoprvkový list
+        // backward compat: a single string → a one-element list
         let one: Config = toml::from_str("[converse]\nack = \"Jistě?\"\n").unwrap();
         assert_eq!(one.converse.ack, vec!["Jistě?".to_string()]);
         one.validate().unwrap();
-        // list frází
+        // list of phrases
         let many: Config = toml::from_str("[converse]\nack = [\"A\", \"B\"]\n").unwrap();
         assert_eq!(many.converse.ack, vec!["A".to_string(), "B".to_string()]);
     }
@@ -982,12 +1375,125 @@ mod tests {
         let mut cfg = Config::default();
         cfg.converse.open_ear_min_words = 0;
         assert!(cfg.validate().is_err());
-        // platné režimy projdou
+        // valid modes pass
         for m in ["off", "followup", "always"] {
             let mut cfg = Config::default();
             cfg.converse.open_ear = m.into();
             assert!(cfg.validate().is_ok(), "režim {m} má být platný");
         }
+    }
+
+    #[test]
+    fn memory_validation_rejects_bad_values() {
+        let mut cfg = Config::default();
+        cfg.memory.retrieve_k = 999;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.memory.snippet_max_chars = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.memory.session_gap_s = 999_999;
+        assert!(cfg.validate().is_err());
+        // boundary-valid values pass (0 = retrieval/limit disabled)
+        let mut cfg = Config::default();
+        cfg.memory.retrieve_k = 0;
+        cfg.memory.session_gap_s = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn proactive_validation_rejects_bad_values() {
+        let mut cfg = Config::default();
+        cfg.proactive.tick_s = 5; // below minimum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.proactive.quiet_from = 24; // outside 0-23
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.proactive.at_desk_idle_s = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.proactive.pattern_min_occurrences = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.proactive.runbook_fail_streak = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.proactive.model = "  ".into();
+        assert!(cfg.validate().is_err());
+        // both the default (disabled) and enabled with sane values pass
+        assert!(Config::default().validate().is_ok());
+        let mut cfg = Config::default();
+        cfg.proactive.enabled = true;
+        cfg.proactive.quiet_from = 0;
+        cfg.proactive.quiet_to = 0; // equal = no quiet window
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tasks_validation_rejects_bad_values() {
+        let mut cfg = Config::default();
+        cfg.tasks.max_output_chars = 10; // below minimum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.tasks.max_output_chars = 200_000; // above maximum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.tasks.min_disk_free_mb = 2_000_000; // above maximum
+        assert!(cfg.validate().is_err());
+        // default and boundary-valid values pass (0 MB = disk warning disabled)
+        assert!(Config::default().validate().is_ok());
+        let mut cfg = Config::default();
+        cfg.tasks.min_disk_free_mb = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn converse_reprompt_greeting_validation_and_defaults() {
+        let mut cfg = Config::default();
+        cfg.converse.reprompt_min_words = 0; // below minimum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.converse.reprompt_min_words = 9; // above maximum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.converse.greeting_gap_s = 10; // gap too short
+        assert!(cfg.validate().is_err());
+        // sane defaults and non-empty lists
+        let d = Config::default();
+        assert!((1..=5).contains(&d.converse.reprompt_min_words));
+        assert!(d.converse.greeting);
+        assert!(!d.converse.reprompt.is_empty());
+        assert!(!d.converse.farewell.is_empty());
+        assert!(cfg_ok(&d));
+        // reprompt/farewell also accept a single string (string_or_seq)
+        let one: Config =
+            toml::from_str("[converse]\nreprompt = \"Co, pane?\"\nfarewell = \"Ahoj.\"\n").unwrap();
+        assert_eq!(one.converse.reprompt, vec!["Co, pane?".to_string()]);
+        assert_eq!(one.converse.farewell, vec!["Ahoj.".to_string()]);
+    }
+
+    fn cfg_ok(c: &Config) -> bool {
+        c.validate().is_ok()
+    }
+
+    #[test]
+    fn converse_filler_validation_and_defaults() {
+        let mut cfg = Config::default();
+        cfg.converse.filler_after_s = 1; // >0 but below minimum 3
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.converse.filler_after_s = 200; // above maximum
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.converse.filler_after_s = 0; // disabled = valid
+        assert!(cfg.validate().is_ok());
+        // default has filler enabled with a sane value and a non-empty list
+        let d = Config::default();
+        assert!((3..=120).contains(&d.converse.filler_after_s));
+        assert!(!d.converse.filler.is_empty());
+        // default ack also includes interjections (…)
+        assert!(d.converse.ack.iter().any(|a| a.contains('…')));
     }
 
     #[test]
@@ -998,10 +1504,15 @@ mod tests {
         assert_eq!(cfg.email.to, "dankrul.krul@gmail.com");
         assert_eq!(cfg.digest.hour, 19);
         assert_eq!(cfg.retention.screenshots_days, 7);
-        // čeština je default celého asistenta
+        // Czech is the default for the whole assistant
         assert_eq!(cfg.listen.language, "cs");
         assert_eq!(cfg.speak.language, "cs");
-        assert_eq!(cfg.speak.model_id, "eleven_multilingual_v2");
+        // snappy defaults for a smooth conversation
+        assert_eq!(cfg.speak.model_id, "eleven_flash_v2_5");
+        assert!(cfg.speak.stream);
+        assert_eq!(cfg.listen.silence_ms, 480);
+        assert_eq!(cfg.converse.open_ear, "followup");
+        assert!(cfg.converse.barge_in);
     }
 
     #[test]
@@ -1034,7 +1545,7 @@ mod tests {
 
     #[test]
     fn secret_reads_any_key_from_env_file() {
-        // env by přebilo soubor — pro test musí být čisté
+        // env would override the file — must be clean for the test
         std::env::remove_var("SENDGRID_API_KEY");
         std::env::remove_var("ELEVENLABS_API_KEY");
         let dir = std::env::temp_dir().join(format!("jarvis-test-{}", std::process::id()));

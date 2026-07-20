@@ -1,13 +1,13 @@
-//! Sdílené nízkoúrovňové X11 helpery pro capture (snímání) a wm (ovládání
-//! oken). Čtení vlastností nikdy nepanikaří — okno může zmizet mezi dotazy,
-//! titulky můžou být ne-UTF8.
+//! Shared low-level X11 helpers for capture (screenshots) and wm (window
+//! control). Property reads must never panic — a window can vanish between
+//! queries, and titles may be non-UTF8.
 
 use anyhow::{bail, Context, Result};
 use image::RgbImage;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, Window};
 
-/// UTF-8 lossy, bez řídicích znaků, oříznuto na max_chars.
+/// UTF-8 lossy, control characters stripped, truncated to max_chars.
 pub fn sanitize(bytes: &[u8], max_chars: usize) -> String {
     let s: String = String::from_utf8_lossy(bytes)
         .chars()
@@ -35,7 +35,7 @@ pub fn get_prop_u32<C: Connection>(conn: &C, window: Window, prop: Atom) -> Opti
     reply.value32().and_then(|mut it| it.next())
 }
 
-/// Seznam oken z vlastnosti typu WINDOW[] (např. _NET_CLIENT_LIST).
+/// List of windows from a WINDOW[]-typed property (e.g. _NET_CLIENT_LIST).
 pub fn get_prop_windows<C: Connection>(conn: &C, window: Window, prop: Atom) -> Vec<Window> {
     conn.get_property(false, window, prop, AtomEnum::ANY, 0, 4096)
         .ok()
@@ -44,7 +44,7 @@ pub fn get_prop_windows<C: Connection>(conn: &C, window: Window, prop: Atom) -> 
         .unwrap_or_default()
 }
 
-/// _NET_WM_NAME (UTF-8), fallback WM_NAME.
+/// _NET_WM_NAME (UTF-8), falling back to WM_NAME.
 pub fn window_title<C: Connection>(conn: &C, win: Window, atom_net_wm_name: Atom) -> String {
     let bytes = get_prop_bytes(conn, win, atom_net_wm_name)
         .filter(|b| !b.is_empty())
@@ -53,7 +53,7 @@ pub fn window_title<C: Connection>(conn: &C, win: Window, atom_net_wm_name: Atom
     sanitize(&bytes, 500)
 }
 
-/// WM_CLASS = "instance\0class\0" — bereme class, fallback instance.
+/// WM_CLASS = "instance\0class\0" — we take class, falling back to instance.
 pub fn window_class<C: Connection>(conn: &C, win: Window) -> String {
     let bytes = get_prop_bytes(conn, win, AtomEnum::WM_CLASS.into()).unwrap_or_default();
     let parts: Vec<String> = bytes
@@ -64,8 +64,8 @@ pub fn window_class<C: Connection>(conn: &C, win: Window) -> String {
     parts.get(1).or_else(|| parts.first()).cloned().unwrap_or_default()
 }
 
-/// Převod dat GetImage (Z_PIXMAP, depth 24/32) na RGB obraz.
-/// `pixmap_formats` = (depth, bits_per_pixel) ze setupu spojení.
+/// Converts GetImage data (Z_PIXMAP, depth 24/32) into an RGB image.
+/// `pixmap_formats` = (depth, bits_per_pixel) from the connection setup.
 pub fn zpixmap_to_rgb(
     data: &[u8],
     depth: u8,
@@ -82,7 +82,7 @@ pub fn zpixmap_to_rgb(
         bail!("GetImage vrátil prázdná data");
     }
     let stride = data.len() / h_us;
-    // bits_per_pixel ze setupu; fallback na odvození ze stride
+    // bits_per_pixel from setup; falls back to deriving it from the stride
     let bytes_px = pixmap_formats
         .iter()
         .find(|(d, _)| *d == depth)
@@ -115,7 +115,7 @@ pub fn zpixmap_to_rgb(
         .context("nelze složit RGB obraz z X dat")
 }
 
-/// Uloží RGB obraz jako JPEG q90 (stejný formát jako capture snímky).
+/// Saves an RGB image as JPEG q90 (same format as capture snapshots).
 pub fn save_jpeg(img: &RgbImage, path: &std::path::Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn sanitize_strips_controls_and_trims() {
-        // tab i newline jsou řídicí znaky, filtrují se bez náhrady
+        // tab and newline are control chars, filtered out with no replacement
         assert_eq!(sanitize(b"  vim\tPLAN.md\n", 100), "vimPLAN.md");
     }
 

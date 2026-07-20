@@ -1,11 +1,13 @@
-//! Ovládání oken, klávesnice a myši (X11): EWMH client messages pro okna,
-//! XTest pro syntetický vstup, GetImage pro screenshoty. CLI `jarvis wm …`
-//! slouží člověku i konverzačnímu agentovi (Bash omezený na `jarvis wm`).
+//! Window, keyboard, and mouse control (X11): EWMH client messages for
+//! windows, XTest for synthetic input, GetImage for screenshots. The CLI
+//! `jarvis wm …` serves both the human and the conversational agent (whose
+//! Bash access is restricted to `jarvis wm`).
 //!
-//! Psaní textu: znak → keysym (Latin-1 přímo, jinak 0x0100_0000+kódový bod
-//! dle X11 konvence). Keysym, který v aktuálním rozložení chybí (česká
-//! diakritika na US layoutu, emoji…), se dočasně namapuje na volný keycode
-//! a po dopsání se mapa obnoví — stejný trik používá xdotool.
+//! Text typing: char → keysym (Latin-1 directly, otherwise 0x0100_0000 +
+//! code point per X11 convention). A keysym missing from the current layout
+//! (Czech diacritics on a US layout, emoji…) gets temporarily mapped onto a
+//! spare keycode and the map is restored after typing — the same trick
+//! xdotool uses.
 
 use crate::config::{Config, Paths};
 use crate::x11util;
@@ -28,8 +30,8 @@ const XK_ALT_L: u32 = 0xffe9;
 const XK_SUPER_L: u32 = 0xffeb;
 const XK_ISO_LEVEL3_SHIFT: u32 = 0xfe03;
 
-/// Pauza po přemapování keycode — klienti (hlavně Chromium/Electron) musí
-/// stihnout zpracovat MappingNotify, než přijde fake stisk.
+/// Pause after remapping a keycode — clients (especially Chromium/Electron)
+/// need time to process MappingNotify before the fake keypress arrives.
 const REMAP_SETTLE_MS: u64 = 30;
 
 #[derive(Debug, Clone)]
@@ -128,7 +130,7 @@ impl Wm {
         })
     }
 
-    /// Ověří dostupnost XTest — bez něj nejde syntetický vstup.
+    /// Checks XTest is available — without it, synthetic input isn't possible.
     pub fn ensure_xtest(&self) -> Result<()> {
         self.conn
             .xtest_get_version(2, 2)
@@ -138,7 +140,7 @@ impl Wm {
         Ok(())
     }
 
-    /// Round-trip: server zpracoval všechny předchozí requesty.
+    /// Round-trip: the server has processed all prior requests.
     fn sync(&self) -> Result<()> {
         self.conn.get_input_focus()?.reply()?;
         Ok(())
@@ -170,8 +172,8 @@ impl Wm {
         self.active_id().map(|w| self.meta(w))
     }
 
-    /// Najde okno: "0xID", jinak podřetězec třídy (přednost) nebo titulku,
-    /// case-insensitive; při shodě víc oken vyhrává nejvýš položené.
+    /// Finds a window: "0xID", otherwise a substring of the class (priority)
+    /// or title, case-insensitive; on multiple matches, the topmost wins.
     pub fn resolve(&self, query: &str) -> Result<WinMeta> {
         let wins = self.windows()?;
         if let Some(hex) = query.strip_prefix("0x").or_else(|| query.strip_prefix("0X")) {
@@ -207,9 +209,9 @@ impl Wm {
         Ok(())
     }
 
-    /// Aktivuje okno a počká na read-back přes _NET_ACTIVE_WINDOW (až 2 s).
+    /// Activates a window and waits for read-back via _NET_ACTIVE_WINDOW (up to 2 s).
     pub fn activate(&self, win: Window) -> Result<WinMeta> {
-        // source indication 2 = pager/uživatelská akce — WM ji respektuje
+        // source indication 2 = pager/user action — the WM respects it
         self.client_message(win, self.a.active_window, [2, 0, 0, 0, 0])?;
         for _ in 0..25 {
             std::thread::sleep(Duration::from_millis(80));
@@ -261,7 +263,7 @@ impl Wm {
         Ok(())
     }
 
-    /// Čeká, až se objeví okno odpovídající dotazu.
+    /// Waits until a window matching the query appears.
     pub fn wait(&self, query: &str, timeout: Duration) -> Result<WinMeta> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -278,9 +280,9 @@ impl Wm {
         }
     }
 
-    /// Čeká na okno, které v `before` ještě nebylo (čerstvě spuštěná
-    /// aplikace). _NET_CLIENT_LIST override-redirect okna (notifikace,
-    /// tooltips) neobsahuje, takže falešné poplachy jsou vzácné.
+    /// Waits for a window not already present in `before` (a freshly launched
+    /// app). _NET_CLIENT_LIST excludes override-redirect windows (notifications,
+    /// tooltips), so false positives are rare.
     pub fn wait_new(
         &self,
         before: &std::collections::HashSet<Window>,
@@ -299,7 +301,7 @@ impl Wm {
         }
     }
 
-    // ---------- klávesnice ----------
+    // ---------- keyboard ----------
 
     fn fetch_keymap(&self) -> Result<Keymap> {
         let (min, max) = {
@@ -323,7 +325,7 @@ impl Wm {
         Ok(())
     }
 
-    /// Namapuje keysym na zapůjčený keycode (jednou, cache drží poslední sym).
+    /// Maps a keysym onto a borrowed keycode (once, the cache holds the last symbol).
     fn bind_spare(&self, km: &mut Keymap, sym: u32) -> Result<u8> {
         let kc = match km.borrowed {
             Some(kc) => kc,
@@ -342,7 +344,7 @@ impl Wm {
         Ok(kc)
     }
 
-    /// Vrátí zapůjčenému keycode původní keysymy.
+    /// Restores the borrowed keycode's original keysyms.
     fn restore_borrowed(&self, km: &Keymap) -> Result<()> {
         if let Some(kc) = km.borrowed {
             let row = km.row(kc).to_vec();
@@ -353,7 +355,7 @@ impl Wm {
         Ok(())
     }
 
-    /// Napíše text do aktuálně fokusovaného okna. Vrací počet znaků.
+    /// Types text into the currently focused window. Returns the character count.
     pub fn type_text(&self, text: &str) -> Result<usize> {
         self.ensure_xtest()?;
         let mut km = self.fetch_keymap()?;
@@ -371,8 +373,8 @@ impl Wm {
                 if need_shift {
                     self.fake_key(shift, true)?;
                 }
-                // uvolnění musí proběhnout i při chybě mezi press a release —
-                // jinak zůstane klávesa/Shift logicky držená a kazí další vstup
+                // release must happen even on error between press and release —
+                // otherwise the key/Shift stays logically held and corrupts further input
                 let press = self.fake_key(kc, true);
                 let release = if press.is_ok() { self.fake_key(kc, false) } else { Ok(()) };
                 if need_shift {
@@ -392,7 +394,7 @@ impl Wm {
         Ok(typed)
     }
 
-    /// Stiskne zkratku ("ctrl+f", "Return", "alt+F4", "ctrl++").
+    /// Presses a shortcut ("ctrl+f", "Return", "alt+F4", "ctrl++").
     pub fn key_combo(&self, combo: &str) -> Result<()> {
         self.ensure_xtest()?;
         let (mod_syms, key_sym) = parse_combo(combo)?;
@@ -428,9 +430,9 @@ impl Wm {
             Ok(())
         })();
         if result.is_err() {
-            // po chybě uprostřed sekvence uvolni vše, co mohlo zůstat stisknuté;
-            // release nestisknuté klávesy je v X neškodný no-op, zato zaseknutý
-            // Ctrl/Shift by kazil další skutečný vstup uživatele
+            // after an error mid-sequence, release everything that might still be
+            // held; releasing an unpressed key is a harmless no-op in X, but a
+            // stuck Ctrl/Shift would corrupt the user's next real input
             let _ = self.fake_key(kc, false);
             for &mk in mod_kcs.iter().rev() {
                 let _ = self.fake_key(mk, false);
@@ -443,11 +445,11 @@ impl Wm {
         Ok(())
     }
 
-    // ---------- myš ----------
+    // ---------- mouse ----------
 
     pub fn move_pointer(&self, x: i16, y: i16) -> Result<()> {
         self.ensure_xtest()?;
-        // detail 0 = absolutní souřadnice na root okně
+        // detail 0 = absolute coordinates on the root window
         self.conn
             .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, x11rb::CURRENT_TIME, self.root, x, y, 0)?;
         self.conn.flush()?;
@@ -490,7 +492,7 @@ impl Wm {
 
     // ---------- screenshot ----------
 
-    /// Snímek celé obrazovky, nebo výřez okna (query). Uloží JPEG.
+    /// Captures the whole screen, or a window crop (query). Saves as JPEG.
     pub fn screenshot(&self, window_query: Option<&str>, out: &std::path::Path) -> Result<()> {
         let reply = self
             .conn
@@ -532,15 +534,15 @@ impl Wm {
     }
 }
 
-// ---------- čisté helpery (unit-testované) ----------
+// ---------- pure helpers (unit-tested) ----------
 
 struct Keymap {
     min: u8,
     per: usize,
     syms: Vec<u32>,
-    /// keycode zapůjčený pro nemapované znaky (obnoví se po akci)
+    /// keycode borrowed for unmapped characters (restored after the action)
     borrowed: Option<u8>,
-    /// keysym právě navázaný na zapůjčený keycode
+    /// keysym currently bound to the borrowed keycode
     bound_sym: Option<u32>,
 }
 
@@ -558,7 +560,7 @@ impl Keymap {
         &self.syms[i..i + self.per]
     }
 
-    /// (keycode, potřebuje Shift) — sloupec 0 bez Shiftu, sloupec 1 s ním.
+    /// (keycode, needs Shift) — column 0 without Shift, column 1 with it.
     fn find(&self, sym: u32) -> Option<(u8, bool)> {
         for k in 0..self.count() {
             let kc = self.min + k as u8;
@@ -573,14 +575,14 @@ impl Keymap {
         None
     }
 
-    /// Keycode se symem v libovolném sloupci (modifikátory).
+    /// Keycode with the symbol in any column (modifiers).
     fn find_any(&self, sym: u32) -> Option<u8> {
         (0..self.count())
             .map(|k| self.min + k as u8)
             .find(|&kc| self.row(kc).contains(&sym))
     }
 
-    /// Nejvyšší keycode bez jediného keysymu — bezpečný k zapůjčení.
+    /// Highest keycode with no keysym at all — safe to borrow.
     fn spare(&self) -> Option<u8> {
         (0..self.count())
             .rev()
@@ -589,8 +591,8 @@ impl Keymap {
     }
 }
 
-/// Keysym znaku dle X11 konvence: řídicí klávesy jmenovitě, Latin-1 přímo,
-/// ostatní Unicode = 0x0100_0000 + kódový bod.
+/// Keysym for a char per X11 convention: control keys by name, Latin-1
+/// directly, other Unicode = 0x0100_0000 + code point.
 pub(crate) fn keysym_for_char(c: char) -> u32 {
     match c {
         '\n' | '\r' => XK_RETURN,
@@ -606,7 +608,7 @@ pub(crate) fn keysym_for_char(c: char) -> u32 {
     }
 }
 
-/// Pojmenované klávesy pro `wm key` (case-insensitive) + F1–F24.
+/// Named keys for `wm key` (case-insensitive) + F1–F24.
 pub(crate) fn named_keysym(name: &str) -> Option<u32> {
     let n = name.to_ascii_lowercase();
     let sym = match n.as_str() {
@@ -637,7 +639,7 @@ pub(crate) fn named_keysym(name: &str) -> Option<u32> {
     Some(sym)
 }
 
-/// "ctrl+shift+k" → (mod keysymy, keysym klávesy). "ctrl++" = Ctrl a '+'.
+/// "ctrl+shift+k" → (modifier keysyms, key keysym). "ctrl++" = Ctrl and '+'.
 pub(crate) fn parse_combo(s: &str) -> Result<(Vec<u32>, u32)> {
     let s = s.trim();
     ensure!(!s.is_empty(), "prázdná zkratka");
@@ -677,8 +679,8 @@ pub(crate) fn parse_combo(s: &str) -> Result<(Vec<u32>, u32)> {
     Ok((mods, key_sym))
 }
 
-/// Výběr okna: přesná třída > podřetězec třídy > podřetězec titulku;
-/// při stejném ranku vyhrává okno nejvýš ve stacking order.
+/// Window selection: exact class match > class substring > title substring;
+/// on equal rank, the topmost window in stacking order wins.
 pub(crate) fn pick_window(wins: &[WinMeta], stacking: &[Window], query: &str) -> Option<usize> {
     let q = query.to_lowercase();
     if q.is_empty() {
@@ -705,7 +707,7 @@ pub(crate) fn pick_window(wins: &[WinMeta], stacking: &[Window], query: &str) ->
         .map(|(_, _, i)| i)
 }
 
-/// Ořez obdélníku na obrazovku; None = celý mimo.
+/// Clamps a rectangle to the screen; None = entirely off-screen.
 pub(crate) fn clamp_rect(
     x: i32,
     y: i32,
@@ -724,7 +726,7 @@ pub(crate) fn clamp_rect(
     Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
-/// Doslovné "\n" a "\t" v CLI argumentu na skutečné znaky.
+/// Turns literal "\n" and "\t" in a CLI argument into real characters.
 pub(crate) fn unescape(text: &str) -> String {
     text.replace("\\n", "\n").replace("\\t", "\t")
 }
@@ -733,29 +735,29 @@ pub(crate) fn unescape(text: &str) -> String {
 
 #[derive(clap::Subcommand)]
 pub enum WmCmd {
-    /// Vypíše okna: ID, plocha, třída, titulek (* = aktivní)
+    /// Lists windows: ID, desktop, class, title (* = active)
     List,
-    /// Vypíše aktivní okno
+    /// Prints the active window
     Active,
-    /// Aktivuje okno a ověří read-backem (query = část třídy/titulku nebo 0xID)
+    /// Activates a window and verifies via read-back (query = part of class/title or 0xID)
     Focus { query: String },
-    /// Zdvořile zavře okno (_NET_CLOSE_WINDOW)
+    /// Politely closes a window (_NET_CLOSE_WINDOW)
     Close { query: String },
-    /// Minimalizuje okno
+    /// Minimizes a window
     Minimize { query: String },
-    /// Maximalizuje okno (--off vrátí)
+    /// Maximizes a window (--off reverses it)
     Maximize {
         query: String,
         #[arg(long)]
         off: bool,
     },
-    /// Přepne okno do fullscreenu (--off vrátí)
+    /// Toggles a window to fullscreen (--off reverses it)
     Fullscreen {
         query: String,
         #[arg(long)]
         off: bool,
     },
-    /// Přesune okno na souřadnice
+    /// Moves a window to coordinates
     Move {
         query: String,
         #[arg(allow_negative_numbers = true)]
@@ -763,49 +765,49 @@ pub enum WmCmd {
         #[arg(allow_negative_numbers = true)]
         y: i32,
     },
-    /// Změní velikost okna
+    /// Resizes a window
     Resize { query: String, width: u32, height: u32 },
-    /// Počká, až se objeví okno (např. po startu aplikace)
+    /// Waits for a window to appear (e.g. after launching an app)
     Wait {
         query: String,
         #[arg(long, default_value_t = 10)]
         timeout_s: u64,
     },
-    /// Spustí aplikaci (odpojeně) a počká na její okno. Mimo terminál jen
-    /// programy z wm.spawn_allowed. Vlastní přepínače patří PŘED program:
-    /// `jarvis wm spawn --window Signal signal-desktop`
+    /// Launches an app (detached) and waits for its window. Outside a
+    /// terminal, only programs from wm.spawn_allowed. Own flags go BEFORE
+    /// the program: `jarvis wm spawn --window Signal signal-desktop`
     Spawn {
-        /// Program (jméno v PATH nebo absolutní cesta) a jeho argumenty
+        /// Program (name in PATH or absolute path) and its arguments
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
-        /// Okno, na které čekat (část třídy/titulku) — pro aplikace, které
-        /// předávají běžící instanci; bez zadání se čeká na jakékoli NOVÉ okno
+        /// Window to wait for (part of class/title) — for apps that hand off
+        /// to a running instance; without it, waits for any NEW window
         #[arg(long)]
         window: Option<String>,
-        /// Jak dlouho čekat na okno
+        /// How long to wait for the window
         #[arg(long, default_value_t = 15)]
         timeout_s: u64,
-        /// Jen spustit, na okno nečekat
+        /// Just launch, don't wait for a window
         #[arg(long)]
         no_wait: bool,
     },
-    /// Napíše text do aktivního okna (XTest; umí diakritiku, "\n" = Enter)
+    /// Types text into the active window (XTest; handles diacritics, "\n" = Enter)
     Type {
-        /// Text; víc argumentů se spojí mezerou
+        /// Text; multiple arguments are joined with a space
         text: Vec<String>,
-        /// Nejdřív aktivovat toto okno (bezpečnější než psát naslepo)
+        /// Activate this window first (safer than typing blind)
         #[arg(long)]
         window: Option<String>,
-        /// Po textu stisknout Enter
+        /// Press Enter after the text
         #[arg(long)]
         enter: bool,
-        /// Rozestup kláves v ms (default z configu wm.key_delay_ms)
+        /// Delay between keystrokes in ms (default from config wm.key_delay_ms)
         #[arg(long)]
         delay_ms: Option<u64>,
     },
-    /// Stiskne zkratky, např. `key ctrl+f` nebo `key ctrl+a Delete`
+    /// Presses shortcuts, e.g. `key ctrl+f` or `key ctrl+a Delete`
     Key { combos: Vec<String> },
-    /// Klikne myší na souřadnice (--button 3 = pravé, --double)
+    /// Clicks the mouse at coordinates (--button 3 = right, --double)
     Click {
         x: u16,
         y: u16,
@@ -814,13 +816,13 @@ pub enum WmCmd {
         #[arg(long)]
         double: bool,
     },
-    /// Přesune kurzor myši
+    /// Moves the mouse cursor
     Pointer { x: u16, y: u16 },
-    /// Uloží screenshot (celá obrazovka, s --window jen okno) a vypíše cestu
+    /// Saves a screenshot (whole screen, or just a window with --window) and prints the path
     Screenshot {
         #[arg(long)]
         window: Option<String>,
-        /// Cílový soubor (default ~/.local/share/jarvis/wm-screenshot.jpg)
+        /// Target file (default ~/.local/share/jarvis/wm-screenshot.jpg)
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -905,15 +907,16 @@ pub fn cli(paths: &Paths, cfg: &Config, cmd: WmCmd) -> Result<()> {
                 None => wm.wait_new(&before, timeout),
             };
             match found {
-                // aktivace best-effort: fullscreen aplikace umí fokus
-                // odmítnout, ale okno tu je a program běží — to je úspěch
+                // best-effort activation: a fullscreen app may refuse focus,
+                // but the window exists and the program is running — that's a success
                 Ok(m) => match wm.activate(m.id) {
                     Ok(m) => println!("aktivní: {m}"),
                     Err(e) => println!("okno je tu: {m} (aktivace selhala: {e})"),
                 },
-                // proces žije, jen okno nikde — pro agenta poctivá zpráva
-                // místo chyby (single-instance aplikace předala běžící
-                // instanci, nebo start trvá déle)
+                // the process is alive, just no window anywhere — an honest
+                // report for the agent instead of an error (a single-instance
+                // app may have handed off to a running instance, or the start
+                // is just slow)
                 Err(e) => println!(
                     "{e} — proces (pid {pid}) běží; aplikace možná předala \
                      běžící instanci, zkontroluj `jarvis wm list` nebo screenshot"
@@ -973,18 +976,19 @@ pub fn cli(paths: &Paths, cfg: &Config, cmd: WmCmd) -> Result<()> {
     Ok(())
 }
 
-/// Neomezený spawn (mimo allowlist) je vědomé rozhodnutí člověka u klávesnice.
-/// Samotné `is_terminal()` je ale děditelná ambientní autorita — pty agenta
-/// nebo špatně nastavený unit ji zdědí a obešly by allowlist. Proto navíc
-/// vyžadujeme explicitní `JARVIS_WM_UNRESTRICTED=1`, který si člověk nastaví
-/// ve svém shellu (démon ani agent ho nemají). Bez něj platí allowlist vždy.
+/// An unrestricted spawn (outside the allowlist) is a conscious decision by
+/// the human at the keyboard. `is_terminal()` alone is inheritable ambient
+/// authority though — an agent's pty or a misconfigured unit would inherit
+/// it and bypass the allowlist. So we additionally require the explicit
+/// `JARVIS_WM_UNRESTRICTED=1`, which the human sets in their own shell (the
+/// daemon and the agent never have it). Without it, the allowlist always applies.
 fn interactive_human() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::env::var_os("JARVIS_WM_UNRESTRICTED").is_some()
 }
 
-/// Mimo neomezený terminál (hlasový agent, timery, běžný shell) smí spawn jen
-/// programy z wm.spawn_allowed — fail-closed.
+/// Outside an unrestricted terminal (voice agent, timers, a plain shell),
+/// spawn is allowed only for programs in wm.spawn_allowed — fail-closed.
 fn ensure_spawn_allowed(program: &str, allowed: &[String]) -> Result<()> {
     if interactive_human() || spawn_permitted(program, allowed) {
         return Ok(());
@@ -996,10 +1000,10 @@ fn ensure_spawn_allowed(program: &str, allowed: &[String]) -> Result<()> {
     )
 }
 
-/// `--out` screenshotu smí mířit jen dovnitř `base` (relativní cesta bez „..“
-/// a bez absolutního kořene). Agent omezený na `jarvis wm` by jinak přes
-/// `--out` zapsal JPEG bajty kamkoli (přepsal config, allowlist, cokoli
-/// zapisovatelného).
+/// A screenshot's `--out` may only point inside `base` (a relative path with
+/// no ".." and no absolute root). An agent restricted to `jarvis wm` would
+/// otherwise write JPEG bytes anywhere via `--out` (overwriting config, the
+/// allowlist, anything writable).
 fn confine_to(requested: &std::path::Path, base: &std::path::Path) -> Result<PathBuf> {
     use std::path::Component;
     for c in requested.components() {
@@ -1014,23 +1018,24 @@ fn confine_to(requested: &std::path::Path, base: &std::path::Path) -> Result<Pat
     Ok(base.join(requested))
 }
 
-/// Přesná shoda s položkou seznamu: holé jméno povoluje jen holé jméno
-/// (binárku najde PATH služby), absolutní cesta jen tu samou cestu. Žádné
-/// basename triky — agent nesmí podvrhnout vlastní binárku mimo PATH.
-/// Pozor: shoduje se jen program, ne argumenty — na allowlist patří jen
-/// listové aplikace; program schopný spustit další příkaz (xterm -e, flatpak
-/// run, env…) by allowlist obešel (viz config.example.toml).
+/// Exact match against a list entry: a bare name only allows the bare name
+/// (PATH resolves the binary), an absolute path only the same path. No
+/// basename tricks — the agent must not be able to slip in its own binary
+/// outside PATH. Note: only the program is matched, not its arguments — the
+/// allowlist should only hold leaf apps; a program able to launch another
+/// command (xterm -e, flatpak run, env…) would bypass the allowlist (see
+/// config.example.toml).
 fn spawn_permitted(program: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|a| a == program)
 }
 
-/// Spustí program odpojeně: vlastní process group (signály Jarvise ho
-/// nezabijí), stdin z /dev/null, výstup do spawn.log (ladění startů).
+/// Launches a program detached: its own process group (signals to Jarvis
+/// don't kill it), stdin from /dev/null, output to spawn.log (for debugging startups).
 fn spawn_detached(program: &str, args: &[String], data_dir: &std::path::Path) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let log_path = data_dir.join("spawn.log");
-    // aplikace do logu sypou svůj stdout — nesmí růst donekonečna
+    // apps dump their stdout into the log — it must not grow forever
     if std::fs::metadata(&log_path).map(|m| m.len() > 10_000_000).unwrap_or(false) {
         let _ = std::fs::remove_file(&log_path);
     }
@@ -1078,7 +1083,7 @@ mod tests {
         let allowed = vec!["firefox".to_string(), "/opt/tools/backup".to_string()];
         assert!(spawn_permitted("firefox", &allowed));
         assert!(spawn_permitted("/opt/tools/backup", &allowed));
-        // cesta ≠ holé jméno: podvržená binárka mimo PATH neprojde
+        // path ≠ bare name: a spoofed binary outside PATH doesn't pass
         assert!(!spawn_permitted("/tmp/evil/firefox", &allowed));
         assert!(!spawn_permitted("fire", &allowed));
         assert!(!spawn_permitted("firefoxx", &allowed));
@@ -1088,7 +1093,7 @@ mod tests {
 
     #[test]
     fn spawn_denied_without_tty_and_allowlist() {
-        // testy běží bez TTY → prázdný allowlist musí odmítnout
+        // tests run without a TTY → an empty allowlist must refuse
         assert!(ensure_spawn_allowed("xclock", &[]).is_err());
         assert!(ensure_spawn_allowed("xclock", &["xclock".to_string()]).is_ok());
     }
@@ -1098,7 +1103,7 @@ mod tests {
         assert_eq!(keysym_for_char('a'), 0x61);
         assert_eq!(keysym_for_char('A'), 0x41);
         assert_eq!(keysym_for_char(' '), 0x20);
-        assert_eq!(keysym_for_char('á'), 0xe1); // Latin-1 přímo
+        assert_eq!(keysym_for_char('á'), 0xe1); // Latin-1 directly
         assert_eq!(keysym_for_char('š'), 0x0100_0161); // Unicode keysym
         assert_eq!(keysym_for_char('ř'), 0x0100_0159);
         assert_eq!(keysym_for_char('€'), 0x0100_20ac);
@@ -1134,7 +1139,7 @@ mod tests {
     }
 
     fn synth_keymap() -> Keymap {
-        // kc8: a/A, kc9: Return, kc10: volný, kc11: Shift_L, kc12: plus/1
+        // kc8: a/A, kc9: Return, kc10: free, kc11: Shift_L, kc12: plus/1
         Keymap {
             min: 8,
             per: 2,
@@ -1156,8 +1161,8 @@ mod tests {
         assert_eq!(km.find(0x61), Some((8, false)));
         assert_eq!(km.find(0x41), Some((8, true))); // A = Shift+a
         assert_eq!(km.find(XK_RETURN), Some((9, false)));
-        assert_eq!(km.find(0x31), Some((12, true))); // 1 nad plusem (cz layout)
-        assert_eq!(km.find(0x0100_0161), None); // š nemapované
+        assert_eq!(km.find(0x31), Some((12, true))); // 1 above plus (cz layout)
+        assert_eq!(km.find(0x0100_0161), None); // š unmapped
         assert_eq!(km.find_any(XK_SHIFT_L), Some(11));
         assert_eq!(km.spare(), Some(10));
         assert_eq!(km.max_keycode(), 12);
@@ -1175,13 +1180,13 @@ mod tests {
             w(3, "Signal", "Signal — druhé okno"),
             w(4, "Xfce4-terminal", "vim signal.rs"),
         ];
-        // stacking zdola nahoru: 3 je výš než 2
+        // stacking bottom to top: 3 is above 2
         let stacking = vec![1, 2, 3, 4];
-        // přesná třída vyhrává nad podřetězcem titulku, topmost vyhrává remízu
+        // exact class beats title substring, topmost wins ties
         assert_eq!(pick_window(&wins, &stacking, "signal"), Some(2));
-        // podřetězec třídy
+        // class substring
         assert_eq!(pick_window(&wins, &stacking, "terminal"), Some(3));
-        // jen titulek
+        // title only
         assert_eq!(pick_window(&wins, &stacking, "firefox"), Some(0));
         assert_eq!(pick_window(&wins, &stacking, "nic-takového"), None);
         assert_eq!(pick_window(&wins, &stacking, ""), None);
@@ -1190,11 +1195,11 @@ mod tests {
     #[test]
     fn clamp_rect_cases() {
         assert_eq!(clamp_rect(10, 10, 100, 50, 1920, 1080), Some((10, 10, 100, 50)));
-        // přesah vpravo dole
+        // overhang bottom-right
         assert_eq!(clamp_rect(1900, 1060, 100, 100, 1920, 1080), Some((1900, 1060, 20, 20)));
-        // záporný počátek
+        // negative origin
         assert_eq!(clamp_rect(-30, -20, 100, 100, 1920, 1080), Some((0, 0, 70, 80)));
-        // úplně mimo
+        // entirely off-screen
         assert_eq!(clamp_rect(2000, 0, 100, 100, 1920, 1080), None);
         assert_eq!(clamp_rect(0, -200, 100, 100, 1920, 1080), None);
     }

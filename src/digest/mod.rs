@@ -10,9 +10,10 @@ use chrono::Timelike;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
-/// Odešle digest uložený v DB pro dané datum. Atomický claim brání dvojímu
-/// odeslání při souběhu digest timeru s hodinovým retry. `force` (explicitní
-/// `digest --send`) smí přeposlat i už odeslaný digest. Vrací true = odesláno.
+/// Sends the digest stored in the DB for the given date. An atomic claim
+/// prevents double-send when the digest timer races the hourly retry.
+/// `force` (explicit `digest --send`) may resend an already-sent digest.
+/// Returns true = sent.
 pub fn send_stored(
     paths: &Paths,
     cfg: &Config,
@@ -20,7 +21,7 @@ pub fn send_stored(
     date: &str,
     force: bool,
 ) -> Result<bool> {
-    let (md, html, _) = db::digest_row(conn, date)?
+    let (md, html, prev_status) = db::digest_row(conn, date)?
         .ok_or_else(|| anyhow!("digest pro {date} v DB neexistuje"))?;
     if !db::claim_digest(conn, date, force)? {
         info!("digest {date} přeskočen — právě ho odesílá jiný proces, nebo už je odeslaný");
@@ -35,15 +36,18 @@ pub fn send_stored(
             Ok(true)
         }
         Err(e) => {
-            // claim vrátit, aby digest zůstal k doeslání
-            let _ = db::unclaim_digest(conn, date);
+            // revert the claim to the state BEFORE the claim: normal send →
+            // pending (stays queued for redelivery), forced resend of an
+            // already-sent digest → back to sent (a failed resend must not
+            // resurrect the digest into the queue and send it twice)
+            let _ = db::unclaim_digest(conn, date, &prev_status);
             Err(e)
         }
     }
 }
 
-/// Doeslání nedoručených digestů — volá se po každé hodinové analýze.
-/// Dnešní digest se posílá až po digest hodině, budoucí data nikdy.
+/// Redelivers undelivered digests — called after every hourly analysis.
+/// Today's digest is sent only after the digest hour; future dates never.
 pub fn retry_pending(paths: &Paths, cfg: &Config, conn: &Connection) {
     let today = util::today_local().format("%Y-%m-%d").to_string();
     let now_hour = chrono::Local::now().hour() as u8;

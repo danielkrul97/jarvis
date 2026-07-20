@@ -3,13 +3,14 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Vygeneruje obsah systemd user units. `exec` = absolutní cesta k binárce,
-/// `display`/`xauthority` se zapékají z aktuální session (capture je potřebuje).
+/// Generates the content of systemd user units. `exec` = absolute path to the binary,
+/// `display`/`xauthority` are baked in from the current session (capture needs them).
 pub fn unit_files(
     exec: &str,
     display: &str,
     xauthority: Option<&str>,
     digest_hour: u8,
+    consolidate_hour: u8,
 ) -> Vec<(&'static str, String)> {
     let xauth_line = xauthority
         .map(|x| format!("Environment=XAUTHORITY={x}\n"))
@@ -118,6 +119,76 @@ pub fn unit_files(
              WantedBy=timers.target\n"
                 .to_string(),
         ),
+        (
+            "jarvis-memory.service",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — noční konsolidace paměti (fakta + embeddingy)\n\n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 ExecStart={exec} memory consolidate\n\
+                 EnvironmentFile=-%h/.config/jarvis/secrets.env\n"
+            ),
+        ),
+        (
+            "jarvis-memory.timer",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — konsolidace paměti (denní timer)\n\n\
+                 [Timer]\n\
+                 OnCalendar=*-*-* {consolidate_hour:02}:30:00\n\
+                 Persistent=true\n\
+                 RandomizedDelaySec=300\n\n\
+                 [Install]\n\
+                 WantedBy=timers.target\n"
+            ),
+        ),
+        (
+            "jarvis-tasks.service",
+            format!(
+                "[Unit]\n\
+                 Description=Jarvis — plánované interní úlohy (samospráva závislostí, údržba)\n\n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 ExecStart={exec} tasks run-due\n\
+                 EnvironmentFile=-%h/.config/jarvis/secrets.env\n"
+            ),
+        ),
+        (
+            // hourly tick: run-due itself handles each task's due schedule (deps every 24h,
+            // cleanup and maintenance daily) — the timer just "pings" often enough.
+            // Persistent catches up a missed window after the machine wakes.
+            "jarvis-tasks.timer",
+            "[Unit]\n\
+             Description=Jarvis — plánované úlohy (timer, hodinová otočka)\n\n\
+             [Timer]\n\
+             OnCalendar=hourly\n\
+             Persistent=true\n\
+             RandomizedDelaySec=180\n\n\
+             [Install]\n\
+             WantedBy=timers.target\n"
+                .to_string(),
+        ),
+    ]
+}
+
+/// Names of all managed user units — for `jarvis kill` and diagnostics, without
+/// needing to know exec/DISPLAY (unlike `unit_files`). Kept in sync
+/// with `unit_files` (checked by test `unit_names_match_unit_files`).
+pub fn unit_names() -> Vec<&'static str> {
+    vec![
+        "jarvis-capture.service",
+        "jarvis-listen.service",
+        "jarvis-analyze.service",
+        "jarvis-analyze.timer",
+        "jarvis-digest.service",
+        "jarvis-digest.timer",
+        "jarvis-runbooks.service",
+        "jarvis-runbooks.timer",
+        "jarvis-memory.service",
+        "jarvis-memory.timer",
+        "jarvis-tasks.service",
+        "jarvis-tasks.timer",
     ]
 }
 
@@ -134,7 +205,8 @@ pub fn install(cfg: &Config, print_only: bool) -> Result<()> {
     }
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
     let xauthority = std::env::var("XAUTHORITY").ok();
-    let units = unit_files(&exec, &display, xauthority.as_deref(), cfg.digest.hour);
+    let units =
+        unit_files(&exec, &display, xauthority.as_deref(), cfg.digest.hour, cfg.memory.consolidate_hour);
 
     if print_only {
         for (name, content) in &units {
@@ -165,14 +237,26 @@ pub fn install(cfg: &Config, print_only: bool) -> Result<()> {
     if cfg.runbooks.enabled {
         enable.push("jarvis-runbooks.timer");
     }
+    if cfg.memory.enabled && cfg.memory.consolidate {
+        enable.push("jarvis-memory.timer");
+    }
+    if cfg.tasks.enabled {
+        enable.push("jarvis-tasks.timer");
+    }
     systemctl(&enable)?;
     if !cfg.listen.enabled {
-        // poslech vypnutý v configu → případnou dřívější službu zastavit;
-        // best effort (unit nemusí existovat)
+        // listen disabled in config → stop any previously enabled service;
+        // best effort (the unit may not exist)
         let _ = systemctl(&["disable", "--now", "jarvis-listen.service"]);
     }
     if !cfg.runbooks.enabled {
         let _ = systemctl(&["disable", "--now", "jarvis-runbooks.timer"]);
+    }
+    if !(cfg.memory.enabled && cfg.memory.consolidate) {
+        let _ = systemctl(&["disable", "--now", "jarvis-memory.timer"]);
+    }
+    if !cfg.tasks.enabled {
+        let _ = systemctl(&["disable", "--now", "jarvis-tasks.timer"]);
     }
     println!("Units aktivní. Kontrola: systemctl --user list-timers 'jarvis-*'");
     Ok(())
@@ -200,8 +284,8 @@ mod tests {
 
     #[test]
     fn units_contain_essentials() {
-        let units = unit_files("/usr/bin/jarvis", ":0.0", Some("/home/u/.Xauthority"), 19);
-        assert_eq!(units.len(), 8);
+        let units = unit_files("/usr/bin/jarvis", ":0.0", Some("/home/u/.Xauthority"), 19, 4);
+        assert_eq!(units.len(), 12);
         let capture = &units[0].1;
         assert!(capture.contains("ExecStart=/usr/bin/jarvis capture"));
         assert!(capture.contains("Environment=DISPLAY=:0.0"));
@@ -213,7 +297,7 @@ mod tests {
         let digest_timer = &units[5].1;
         assert!(digest_timer.contains("OnCalendar=*-*-* 19:00:00"));
         assert!(digest_timer.contains("Persistent=true"));
-        // runbooky: skripty můžou hýbat okny → služba potřebuje X prostředí
+        // runbooks: scripts may move windows → the service needs an X environment
         let runbooks = &units[6].1;
         assert!(runbooks.contains("ExecStart=/usr/bin/jarvis runbook run-due"));
         assert!(runbooks.contains("Environment=DISPLAY=:0.0"));
@@ -221,13 +305,37 @@ mod tests {
         let runbooks_timer = &units[7].1;
         assert!(runbooks_timer.contains("OnCalendar=*:0/5"));
         assert!(runbooks_timer.contains("Persistent=true"));
+        // memory: nightly consolidation of facts + embeddings (no X, just claude+DB)
+        let memory_svc = &units[8].1;
+        assert!(memory_svc.contains("ExecStart=/usr/bin/jarvis memory consolidate"));
+        assert!(memory_svc.contains("Type=oneshot"));
+        let memory_timer = &units[9].1;
+        assert!(memory_timer.contains("OnCalendar=*-*-* 04:30:00")); // consolidate_hour=4
+        assert!(memory_timer.contains("Persistent=true"));
+        // scheduled tasks: oneshot run-due + hourly tick (the due schedule is internal)
+        let tasks_svc = &units[10].1;
+        assert!(tasks_svc.contains("ExecStart=/usr/bin/jarvis tasks run-due"));
+        assert!(tasks_svc.contains("Type=oneshot"));
+        let tasks_timer = &units[11].1;
+        assert!(tasks_timer.contains("OnCalendar=hourly"));
+        assert!(tasks_timer.contains("Persistent=true"));
+    }
+
+    #[test]
+    fn unit_names_match_unit_files() {
+        // kill relies on `unit_names` covering exactly what `unit_files`
+        // generates (and in the same order) — otherwise kill would miss a unit
+        let from_files: Vec<&str> =
+            unit_files("/x", ":0", None, 19, 4).iter().map(|(n, _)| *n).collect();
+        assert_eq!(from_files, unit_names());
     }
 
     #[test]
     fn units_without_xauthority() {
-        let units = unit_files("/x", ":0", None, 7);
+        let units = unit_files("/x", ":0", None, 7, 3);
         assert!(!units[0].1.contains("XAUTHORITY"));
         assert!(!units[6].1.contains("XAUTHORITY"));
         assert!(units[5].1.contains("07:00:00"));
+        assert!(units[9].1.contains("03:30:00")); // consolidate_hour=3
     }
 }

@@ -1,8 +1,8 @@
 use image::imageops::{self, FilterType};
 use image::RgbImage;
 
-/// dHash: zmenšení na 9x8 v odstínech šedi, bit = jas(x) > jas(x+1).
-/// Stabilní vůči drobnému šumu, citlivý na změnu rozložení obrazovky.
+/// dHash: downscale to 9x8 grayscale, bit = brightness(x) > brightness(x+1).
+/// Stable against minor noise, sensitive to layout changes on screen.
 pub fn dhash(img: &RgbImage) -> u64 {
     let gray = imageops::grayscale(img);
     let small = imageops::resize(&gray, 9, 8, FilterType::Triangle);

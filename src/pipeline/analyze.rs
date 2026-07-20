@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// JSON kontrakt hodinového souhrnu (ukládá se do hourly_summaries.json).
+/// JSON contract for the hourly summary (stored in hourly_summaries.json).
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HourlyJson {
@@ -30,7 +30,7 @@ pub struct Activity {
     pub app: String,
 }
 
-/// Zpracuje okno od watermarky (nebo posledních N hodin) po hodinových kusech.
+/// Processes the window from the watermark (or the last N hours) in hourly chunks.
 pub fn run(
     paths: &Paths,
     cfg: &Config,
@@ -38,15 +38,17 @@ pub fn run(
     dry_run: bool,
     window_hours: Option<u64>,
 ) -> Result<()> {
-    // -5 s: capture tick bere ts před insertem — okno končící přesně `now`
-    // by mohlo trvale přeskočit vzorek commitnutý o chvíli později
+    // -5 s: the capture tick takes ts before the insert — a window ending exactly at `now`
+    // could permanently skip a sample committed moments later
     let now = util::now_ts() - 5;
-    let start = match window_hours {
-        Some(h) => now - (h * 3600) as i64,
-        None => db::state_get_i64(conn, "analyze_watermark")?.unwrap_or(now - 3600),
+    let (start, clamp_catchup) = match window_hours {
+        Some(h) => (now - (h * 3600) as i64, false),
+        None => (db::state_get_i64(conn, "analyze_watermark")?.unwrap_or(now - 3600), true),
     };
-    // pojistka proti nekonečnému dojíždění po dlouhé odstávce
-    let mut chunk_start = start.max(now - 48 * 3600);
+    // the catch-up cap only applies to the watermark (a daemon off for a week
+    // must not flood us with hourly chunks); explicit --window-hours is a
+    // deliberate user choice, so we honor it in full instead of silently clamping it
+    let mut chunk_start = if clamp_catchup { start.max(now - 48 * 3600) } else { start };
     if chunk_start >= now {
         info!("analyze: žádné nové období ke zpracování");
         return Ok(());
@@ -55,8 +57,8 @@ pub fn run(
         let chunk_end = (chunk_start + 3600).min(now);
         process_chunk(paths, cfg, conn, chunk_start, chunk_end, dry_run)?;
         if !dry_run {
-            // watermark se jen posouvá vpřed — rerun přes --window-hours
-            // nesmí vrátit zpracované období zpět do fronty
+            // the watermark only moves forward — a rerun via --window-hours
+            // must not put an already-processed period back in the queue
             let current = db::state_get_i64(conn, "analyze_watermark")?.unwrap_or(0);
             if chunk_end > current {
                 db::state_set(conn, "analyze_watermark", &chunk_end.to_string())?;
@@ -65,7 +67,7 @@ pub fn run(
         chunk_start = chunk_end;
     }
     if !dry_run {
-        // hodinová pojistka doručení: nedoručené digesty (výpadek SendGrid apod.)
+        // hourly delivery safety net: undelivered digests (SendGrid outage etc.)
         crate::digest::retry_pending(paths, cfg, conn);
     }
     Ok(())
@@ -146,8 +148,8 @@ fn process_chunk(
     Ok(())
 }
 
-/// Dvě kola: claude volání + parse; nevalidní JSON nebo chyba CLI → jeden retry.
-/// Cena se účtuje za každý pokus (i neúspěšný parse stál tokeny).
+/// Two rounds: claude call + parse; invalid JSON or a CLI error → one retry.
+/// Cost is billed per attempt (even a failed parse still cost tokens).
 fn call_claude_hourly(
     cfg: &Config,
     paths: &Paths,
@@ -223,7 +225,7 @@ fn build_prompt(timeline: &str, frames: &[String], from: i64, to: i64) -> String
     p
 }
 
-/// Fallback bez Claude: aktivity deterministicky z nejdelších segmentů.
+/// Fallback without Claude: activities deterministically taken from the longest segments.
 pub fn degraded_summary(segs: &[segment::Segment]) -> HourlyJson {
     let mut ordered: Vec<&segment::Segment> = segs.iter().collect();
     ordered.sort_by_key(|s| std::cmp::Reverse(s.duration_s()));

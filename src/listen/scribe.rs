@@ -1,8 +1,9 @@
-//! ElevenLabs Scribe (Speech-to-Text) klient — cloudová alternativa
-//! k lokálnímu whisperu (`stt.rs`). Přepis přesune z CPU/GPU do cloudu za
-//! ~0,22 $/h audia. Sync (ureq) jako zbytek projektu; multipart tělo se
-//! skládá ručně (projekt záměrně nemá extra závislosti — i WAV parser je
-//! vlastní). Chyby API se překládají na česká hlášení s nápovědou.
+//! ElevenLabs Scribe (Speech-to-Text) client — a cloud alternative to local
+//! whisper (`stt.rs`). Moves transcription off CPU/GPU to the cloud at
+//! ~$0.22/h of audio. Sync (ureq) like the rest of the project; the
+//! multipart body is built by hand (the project deliberately avoids extra
+//! dependencies — even the WAV parser is homegrown). API errors are
+//! translated into Czech messages with a hint (user-facing).
 
 use crate::config::ListenCfg;
 use crate::listen::audio;
@@ -12,16 +13,17 @@ use anyhow::{anyhow, Result};
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.elevenlabs.io";
-/// Scribe vyžaduje ≥100 ms audia; kratší promluvu doplníme tichem (16 kHz).
+/// Scribe requires ≥100 ms of audio; a shorter utterance is padded with silence (16 kHz).
 const MIN_SAMPLES: usize = 1_600;
 
-/// Přepíše promluvu (PCM 16 kHz mono) přes Scribe. None = přepis bez řeči.
-/// Retry 1× na 429/5xx/transport; 4xx je fatální hned (jako v `tts.rs`).
+/// Transcribes an utterance (PCM 16 kHz mono) via Scribe. None = transcript
+/// had no speech. Retries once on 429/5xx/transport; 4xx is fatal immediately
+/// (same as `tts.rs`).
 pub fn transcribe(api_key: &str, cfg: &ListenCfg, samples: &[i16]) -> Result<Option<Transcript>> {
     if samples.is_empty() {
         return Ok(None);
     }
-    // doplnit na 100 ms, jinak API vrátí 400 na příliš krátký klip
+    // pad to 100 ms, otherwise the API returns 400 for too-short a clip
     let padded;
     let samples = if samples.len() < MIN_SAMPLES {
         padded = {
@@ -74,7 +76,7 @@ pub fn transcribe(api_key: &str, cfg: &ListenCfg, samples: &[i16]) -> Result<Opt
     Err(anyhow!("Scribe: vyčerpány pokusy, poslední chyba: {last}"))
 }
 
-/// Složí multipart/form-data tělo: model_id, řídicí přepínače a WAV soubor.
+/// Builds the multipart/form-data body: model_id, control flags, and the WAV file.
 fn build_multipart(boundary: &str, cfg: &ListenCfg, wav: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(wav.len() + 512);
     let mut field = |name: &str, value: &str| {
@@ -86,19 +88,19 @@ fn build_multipart(boundary: &str, cfg: &ListenCfg, wav: &[u8]) -> Vec<u8> {
         b.extend_from_slice(b"\r\n");
     };
     field("model_id", &cfg.scribe_model);
-    // vynucení jazyka šetří latenci i chyby autodetekce; "auto" = nechat na API
+    // forcing the language saves latency and autodetection errors; "auto" = leave it to the API
     if cfg.language != "auto" {
         field("language_code", &cfg.language);
     }
-    // pro asistenta chceme čistý text: žádné "(smích)" tagy ani diarizaci
+    // for the assistant we want clean text: no "(laughs)" tags, no diarization
     field("tag_audio_events", "false");
     field("diarize", "false");
     field("timestamps_granularity", "word");
-    // keyterm biasing na vlastní jména (opakované pole = List[str] na serveru)
+    // keyterm biasing for proper names (repeated field = List[str] server-side)
     for kt in &cfg.scribe_keyterms {
         field("keyterms", kt);
     }
-    // soubor jako poslední část
+    // the file goes last
     b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     b.extend_from_slice(
         b"Content-Disposition: form-data; name=\"file\"; filename=\"utterance.wav\"\r\n",
@@ -109,8 +111,8 @@ fn build_multipart(boundary: &str, cfg: &ListenCfg, wav: &[u8]) -> Vec<u8> {
     b
 }
 
-/// Z odpovědi Scribe vytáhne text, jazyk a hrubou jistotu. Prázdný text
-/// (Scribe „neslyšel řeč") = None, stejně jako whisper vrací None.
+/// Extracts text, language, and a rough confidence from the Scribe response.
+/// Empty text (Scribe "heard no speech") = None, same as whisper returns None.
 fn parse_transcript(v: &serde_json::Value) -> Option<Transcript> {
     let text = v["text"].as_str().unwrap_or_default().trim().to_string();
     if text.is_empty() {
@@ -122,9 +124,9 @@ fn parse_transcript(v: &serde_json::Value) -> Option<Transcript> {
     Some(Transcript { text, lang, conf })
 }
 
-/// Jistota 0–1: průměr exp(logprob) přes slovní tokeny (srovnatelné s
-/// whisperovým `conf`, tj. průměrnou pravděpodobností tokenů). Bez slov
-/// (granularita none / prázdné) padáme na `language_probability`.
+/// Confidence 0-1: average of exp(logprob) over word tokens (comparable to
+/// whisper's `conf`, i.e. average token probability). Without words
+/// (granularity none / empty), falls back to `language_probability`.
 fn conf_from_words(words: &serde_json::Value, lang_prob: f32) -> f32 {
     let mut sum = 0f64;
     let mut n = 0u32;
@@ -145,9 +147,10 @@ fn conf_from_words(words: &serde_json::Value, lang_prob: f32) -> f32 {
     }
 }
 
-/// Z chybového JSON `{"detail": {"status": …, "message": …}}` vytáhne
-/// (status, message); `detail` bývá občas i holý string. (Shodné schéma
-/// jako TTS endpoint, ale STT má vlastní sadu statusů/nápověd.)
+/// Extracts (status, message) from the error JSON
+/// `{"detail": {"status": …, "message": …}}`; `detail` is sometimes a bare
+/// string too. (Same schema as the TTS endpoint, but STT has its own set of
+/// statuses/hints.)
 fn error_detail(body: &str) -> (String, String) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let d = &v["detail"];
@@ -163,7 +166,7 @@ fn error_detail(body: &str) -> (String, String) {
     (status, msg)
 }
 
-/// HTTP chybu Scribe převede na srozumitelnou českou chybu s nápovědou.
+/// Converts a Scribe HTTP error into a readable Czech error with a hint (user-facing).
 fn api_error(http: u16, body: &str) -> anyhow::Error {
     let (status, msg) = error_detail(body);
     let hint = match status.as_str() {
@@ -207,14 +210,14 @@ mod tests {
         assert!(s.contains("--\r\n"), "chybí ukončení částí");
         assert!(s.contains("name=\"model_id\"\r\n\r\nscribe_v1\r\n"), "model_id: {s}");
         assert!(s.contains("name=\"language_code\"\r\n\r\ncs\r\n"), "language_code");
-        // keyterm biasing jako opakovaná pole
+        // keyterm biasing as repeated fields
         assert!(s.contains("name=\"keyterms\"\r\n\r\nJarvis\r\n"), "keyterm Jarvis");
         assert!(s.contains("name=\"keyterms\"\r\n\r\nJarvisi\r\n"), "keyterm Jarvisi");
         assert!(s.contains("filename=\"utterance.wav\""), "název souboru");
         assert!(s.contains("Content-Type: audio/wav"), "typ souboru");
-        // uzavírací boundary přesně jednou, na konci
+        // closing boundary exactly once, at the end
         assert!(s.trim_end().ends_with("------test--"), "uzavírací boundary: {s}");
-        // binární WAV je uvnitř těla
+        // binary WAV is inside the body
         assert!(body.windows(4).any(|w| w == b"RIFF"), "WAV data chybí");
     }
 
@@ -236,7 +239,7 @@ mod tests {
 
     #[test]
     fn conf_averages_exp_logprob_over_words() {
-        // dvě slova: logprob 0 → 1.0, logprob ln(0.5) → 0.5; průměr 0.75
+        // two words: logprob 0 → 1.0, logprob ln(0.5) → 0.5; average 0.75
         let v = serde_json::json!({
             "words": [
                 {"type": "word", "logprob": 0.0},
@@ -256,7 +259,7 @@ mod tests {
 
     #[test]
     fn parse_real_response_shape() {
-        // tvar odpovědi dle api-reference/speech-to-text/convert
+        // response shape per api-reference/speech-to-text/convert
         let v = serde_json::json!({
             "language_code": "cs",
             "language_probability": 0.98,

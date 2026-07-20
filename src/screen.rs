@@ -1,51 +1,52 @@
-//! Detekce zámku obrazovky (XFCE screensaver přes session D-Bus).
+//! Screen lock detection (XFCE screensaver via session D-Bus).
 //!
-//! Slouží poslechu: když je obrazovka uzamčená/zhaslá, ambientní mic démon
-//! nic nepřepisuje (soukromí) — stejná cesta jako `jarvis pause`. Ptáme se
-//! `org.xfce.ScreenSaver.GetActive`, což je jazykově nezávislé (na rozdíl od
-//! lokalizovaného výstupu `xfce4-screensaver-command -q`).
+//! Used by listening: when the screen is locked/off, the ambient mic daemon
+//! transcribes nothing (privacy) — same path as `jarvis pause`. We query
+//! `org.xfce.ScreenSaver.GetActive`, which is locale-independent (unlike the
+//! localized output of `xfce4-screensaver-command -q`).
 //!
-//! Fail-open: když stav nejde zjistit (screensaver neběží, chybí dbus-send,
-//! timeout), bereme jako odemčeno — přechodná chyba D-Bus nesmí asistenta
-//! natrvalo umlčet. V běžné XFCE session screensaver běží a dotaz je spolehlivý.
+//! Fail-open: when the state can't be determined (screensaver not running,
+//! dbus-send missing, timeout), we treat it as unlocked — a transient D-Bus
+//! error must not permanently silence the assistant. In a normal XFCE session
+//! the screensaver runs and the query is reliable.
 
 use std::path::Path;
 use std::process::Command;
 use tracing::debug;
 
-/// Stav zámku obrazovky.
+/// Screen lock state.
 pub enum Lock {
-    /// Screensaver/zámek je aktivní → mic démon pauzuje.
+    /// Screensaver/lock is active → mic daemon pauses.
     Active,
-    /// Odemčeno, screensaver neaktivní.
+    /// Unlocked, screensaver inactive.
     Inactive,
-    /// Stav nejde zjistit (služba neběží / chybí dbus-send / timeout) — poslech
-    /// běží dál (fail-open). Nese krátký důvod pro `jarvis doctor`.
+    /// State can't be determined (service not running / dbus-send missing /
+    /// timeout) — listening keeps running (fail-open). Carries a short reason for `jarvis doctor`.
     Unknown(String),
 }
 
-/// Dotáže se xfce4-screensaveru přes `org.xfce.ScreenSaver.GetActive`.
+/// Queries xfce4-screensaver via `org.xfce.ScreenSaver.GetActive`.
 pub fn probe() -> Lock {
-    // Testovací pojistka: vynuť „uzamčeno" bez sahání na screensaver (ověření
-    // cesty pauzy end-to-end, i přes `jarvis doctor`). V provozu nenastavovat.
+    // Test hook: force "locked" without touching the screensaver (verifies
+    // the pause path end-to-end, including via `jarvis doctor`). Don't set in production.
     if matches!(std::env::var("JARVIS_FAKE_SCREEN_LOCKED").ok().as_deref(), Some("1") | Some("true")) {
         return Lock::Active;
     }
     let mut cmd = Command::new("dbus-send");
     cmd.args([
         "--session",
-        // krátký strop: zdravá session bus odpoví v jednotkách ms; 500 ms
-        // pojistí, že zaseknutá sběrnice neblokuje realtime smyčku (rámce
-        // se mezitím hromadí ve 128-frame bufferu, ~3,8 s rezerva)
+        // short cap: a healthy session bus replies within single-digit ms;
+        // 500 ms ensures a stuck bus doesn't block the realtime loop (frames
+        // pile up meanwhile in the 128-frame buffer, ~3.8 s of headroom)
         "--reply-timeout=500",
         "--print-reply=literal",
         "--dest=org.xfce.ScreenSaver",
         "/org/xfce/ScreenSaver",
         "org.xfce.ScreenSaver.GetActive",
     ]);
-    // Pod systemd user službou nemusí být DBUS_SESSION_BUS_ADDRESS v prostředí
-    // (jarvis-listen.service ho explicitně nenastavuje) — dopočítej standardní
-    // cestu k user busu, ať dotaz funguje i tam, nejen z terminálu.
+    // Under a systemd user service, DBUS_SESSION_BUS_ADDRESS may be absent
+    // from the environment (jarvis-listen.service doesn't set it explicitly)
+    // — derive the standard user-bus path, so the query works there too, not just from a terminal.
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         if let Some(addr) = user_bus_address() {
             cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
@@ -60,7 +61,7 @@ pub fn probe() -> Lock {
             }
         }
         Ok(o) => {
-            // typicky ServiceUnknown, když screensaver neběží
+            // typically ServiceUnknown, when the screensaver isn't running
             let stderr = String::from_utf8_lossy(&o.stderr);
             let why = stderr.lines().next().unwrap_or("").trim();
             let why =
@@ -72,14 +73,14 @@ pub fn probe() -> Lock {
     }
 }
 
-/// Je obrazovka uzamčená / screensaver aktivní? `Inactive` i `Unknown` → `false`
-/// (fail-open: přechodná chyba D-Bus nesmí poslech umlčet).
+/// Is the screen locked / screensaver active? Both `Inactive` and `Unknown` → `false`
+/// (fail-open: a transient D-Bus error must not silence listening).
 pub fn locked() -> bool {
     matches!(probe(), Lock::Active)
 }
 
-/// Standardní adresa user session busu, když ji prostředí nemá:
-/// `$XDG_RUNTIME_DIR/bus`, fallback `/run/user/<uid>/bus`. None = socket není.
+/// Standard user session bus address, when the environment lacks it:
+/// `$XDG_RUNTIME_DIR/bus`, fallback `/run/user/<uid>/bus`. None = no socket.
 fn user_bus_address() -> Option<String> {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
         let p = Path::new(&rt).join("bus");
@@ -92,9 +93,9 @@ fn user_bus_address() -> Option<String> {
     Path::new(&p).exists().then(|| format!("unix:path={p}"))
 }
 
-/// Vytáhne boolean z odpovědi `dbus-send --print-reply=literal` (řádek
-/// `   boolean true` / `   boolean false`). Robustní i vůči plné (ne-literal)
-/// odpovědi — bereme poslední token, hlavička žádné `true`/`false` neobsahuje.
+/// Extracts a boolean from a `dbus-send --print-reply=literal` reply (line
+/// `   boolean true` / `   boolean false`). Also robust against a full
+/// (non-literal) reply — we take the last token, since the header never contains `true`/`false`.
 fn parse_active(stdout: &str) -> bool {
     matches!(stdout.split_whitespace().last(), Some("true"))
 }
@@ -105,14 +106,14 @@ mod tests {
 
     #[test]
     fn parses_literal_reply() {
-        // přesně to, co vrací `dbus-send --print-reply=literal ... GetActive`
+        // exactly what `dbus-send --print-reply=literal ... GetActive` returns
         assert!(parse_active("   boolean true\n"));
         assert!(!parse_active("   boolean false\n"));
     }
 
     #[test]
     fn parses_full_reply() {
-        // ne-literal varianta: hlavička + hodnota na druhém řádku
+        // non-literal variant: header + value on the second line
         let full = "method return time=1.2 sender=:1.24 -> destination=:1.9 serial=63 reply_serial=2\n   boolean true\n";
         assert!(parse_active(full));
         let full_false = "method return time=1.2 sender=:1.24 -> destination=:1.9 serial=63 reply_serial=2\n   boolean false\n";
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn empty_or_garbage_is_not_active() {
-        // prázdný stdout (chyba) ani nesmysl nesmí hlásit „uzamčeno" (fail-open)
+        // neither empty stdout (error) nor garbage may report "locked" (fail-open)
         assert!(!parse_active(""));
         assert!(!parse_active("\n"));
         assert!(!parse_active("Error: something broke"));

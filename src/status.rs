@@ -31,7 +31,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         check(true, "config", "soubor neexistuje, používám defaults".into());
     }
 
-    // DISPLAY + X spojení
+    // DISPLAY + X connection
     match std::env::var("DISPLAY") {
         Ok(d) if !d.is_empty() => {
             check(true, "DISPLAY", d.clone());
@@ -47,7 +47,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         _ => check(false, "DISPLAY", "není nastaveno — capture nemůže běžet".into()),
     }
 
-    // ovládání oken (wm): EWMH + XTest pro syntetický vstup
+    // window control (wm): EWMH + XTest for synthetic input
     match crate::wm::Wm::connect(cfg.wm.key_delay_ms) {
         Ok(w) => match w.ensure_xtest() {
             Ok(()) => {
@@ -76,12 +76,12 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         Err(e) => check(false, "claude CLI", format!("nenalezen: {e}")),
     }
 
-    // SendGrid klíč + práva souboru
+    // SendGrid key + file permissions
     match config::sendgrid_key(paths) {
         Ok(_) => {
             let perms_ok = std::fs::metadata(&paths.secrets_file)
                 .map(|m| m.permissions().mode() & 0o077 == 0)
-                .unwrap_or(true); // klíč může být jen v env
+                .unwrap_or(true); // the key may live only in env
             check(
                 perms_ok,
                 "SendGrid klíč",
@@ -95,7 +95,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         Err(e) => check(false, "SendGrid klíč", format!("{e:#}")),
     }
 
-    // runbooky (fáze D): spustitelnost + kanál pro schvalování na dálku
+    // runbooks (phase D): runnability + remote approval channel
     if cfg.runbooks.enabled {
         let conn_check = db::open(&paths.db_path);
         match conn_check {
@@ -148,7 +148,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
     let (bytes, files) = util::dir_size(&paths.shots_dir);
     check(true, "screenshoty", format!("{files} souborů, {}", util::human_bytes(bytes)));
 
-    // poslech
+    // listening
     if cfg.listen.enabled {
         let l = &cfg.listen;
         check(
@@ -160,14 +160,14 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
                 _ => format!("auto: Scribe ({}) → whisper fallback", l.scribe_model),
             },
         );
-        // ElevenLabs klíč pro Scribe (engine auto/elevenlabs)
+        // ElevenLabs key for Scribe (engine auto/elevenlabs)
         if l.engine != "whisper" {
             match config::elevenlabs_key(paths) {
                 Ok(_) => check(true, "ElevenLabs klíč (Scribe)", "nalezen".into()),
                 Err(e) => check(false, "ElevenLabs klíč (Scribe)", format!("{e:#}")),
             }
         }
-        // whisper model: nutný pro engine "whisper", fallback pro "auto"
+        // whisper model: required for engine "whisper", fallback for "auto"
         if l.engine != "elevenlabs" {
             let model = l.resolve_model_path(paths);
             let label = if l.engine == "whisper" { "whisper model" } else { "whisper model (fallback)" };
@@ -194,7 +194,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
                 .map(|b| (*b).to_string())
                 .unwrap_or_else(|| "chybí parec i arecord (pulseaudio-utils / alsa-utils)".into()),
         );
-        // zámek obrazovky: mic démon se pauzuje, když je aktivní screensaver
+        // screen lock: the mic daemon pauses when the screensaver is active
         if cfg.listen.pause_when_locked {
             match crate::screen::probe() {
                 crate::screen::Lock::Active => {
@@ -218,7 +218,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
         check(true, "poslech", "vypnut v configu".into());
     }
 
-    // hlas (TTS): ElevenLabs a/nebo lokální piper podle engine
+    // voice (TTS): ElevenLabs and/or local piper per engine
     if cfg.speak.enabled {
         if cfg.speak.engine != "piper" {
             match config::elevenlabs_key(paths) {
@@ -295,7 +295,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
             Ok(v) => check(true, "claude -p (ping)", v),
             Err(e) => check(false, "claude -p (ping)", format!("{e:#}")),
         }
-        // kredity zajímají TTS (speak) i Scribe STT (listen) — sdílí účet
+        // credits matter for both TTS (speak) and Scribe STT (listen) — shared account
         let uses_elevenlabs = (cfg.speak.enabled && cfg.speak.engine != "piper")
             || (cfg.listen.enabled && cfg.listen.engine != "whisper");
         if uses_elevenlabs {
@@ -329,7 +329,7 @@ pub fn doctor(paths: &Paths, cfg: &Config, live: bool) -> Result<()> {
             }
         }
         if cfg.listen.enabled {
-            // 3 s: webrtc zdroj dává novému klientovi první ~2 s nuly (warm-up)
+            // 3 s: the webrtc source feeds a new client ~2 s of zeros first (warm-up)
             match crate::listen::audio::probe_level(&cfg.listen.device, 3.0) {
                 Ok((dbfs, peak)) => {
                     let has_signal = peak >= 3;
@@ -498,6 +498,52 @@ pub fn status(paths: &Paths, cfg: &Config) -> Result<()> {
         }
     } else {
         println!("  runbooky:       vypnuty v configu");
+    }
+
+    if cfg.tasks.enabled {
+        let reg = crate::tasks::registry();
+        let on = reg.iter().filter(|d| crate::tasks::is_enabled(&conn, d)).count();
+        let last_txt = match crate::tasks::recent_runs(&conn, 1)?.into_iter().next() {
+            Some(r) => format!(
+                "poslední {} „{}“ {}",
+                util::fmt_local(r.started_at),
+                r.task,
+                match (r.finished_at, r.ok) {
+                    (Some(_), Some(true)) => "✓",
+                    (Some(_), Some(false)) => "✗ problém",
+                    (Some(_), None) => "✗",
+                    (None, _) => "⚠ nedoběhl",
+                }
+            ),
+            None => "zatím žádný běh".into(),
+        };
+        println!("  úlohy:          {on}/{} zapnutých; {last_txt}", reg.len());
+    } else {
+        println!("  úlohy:          vypnuty v configu");
+    }
+
+    if cfg.proactive.enabled {
+        let alive = db::state_get_i64(&conn, "nudge_alive_ts")?
+            .map(|t| now - t <= cfg.proactive.tick_s as i64 * 2 + 30)
+            .unwrap_or(false);
+        let today = db::nudge_count_since(&conn, day_start)?;
+        let last_txt = match db::recent_nudges(&conn, 1)?.into_iter().next() {
+            Some(n) => format!(
+                "poslední {} [{}/{}] {}",
+                util::fmt_local(n.ts),
+                n.kind,
+                n.status,
+                util::truncate_chars(&n.evidence, 60)
+            ),
+            None => "zatím žádná nabídka".into(),
+        };
+        println!(
+            "  proaktivní:     {}; dnes {today}/{} nabídek; {last_txt}",
+            if alive { "běží" } else { "smyčka nehlásí tep (běží jen v `jarvis run`)" },
+            cfg.proactive.daily_max
+        );
+    } else {
+        println!("  proaktivní:     vypnuta v configu");
     }
 
     let last_summary: Option<i64> = conn

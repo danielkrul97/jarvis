@@ -2,9 +2,12 @@ mod capture;
 mod config;
 mod converse;
 mod digest;
+mod kill;
 mod listen;
 mod mail;
 mod meet;
+mod memory;
+mod nudge;
 mod patterns;
 mod pipeline;
 mod run;
@@ -14,6 +17,7 @@ mod sms;
 mod speak;
 mod status;
 mod store;
+mod tasks;
 mod telegram;
 mod units;
 mod util;
@@ -36,158 +40,202 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Snímací démon (foreground)
+    /// Capture daemon (foreground)
     Capture,
-    /// Poslech mikrofonu: near-realtime přepis řeči do databáze (foreground)
+    /// Microphone listener: near-realtime speech transcription to the DB (foreground)
     Listen {
-        /// Přepisy jen vypisuj, nezapisuj do DB
+        /// Only print transcripts, don't write to DB
         #[arg(long)]
         print_only: bool,
-        /// Prožeň WAV soubor pipeline (VAD + STT) místo mikrofonu a skonči
+        /// Run a WAV file through the pipeline (VAD + STT) instead of the mic, then exit
         #[arg(long)]
         wav: Option<String>,
-        /// Jednorázově přebij listen.engine ("auto", "elevenlabs", "whisper")
+        /// One-off override of listen.engine ("auto", "elevenlabs", "whisper")
         #[arg(long)]
         engine: Option<String>,
-        /// Jednorázově přebij listen.model z configu (benchmark/ladění)
+        /// One-off override of listen.model from config (benchmarking/tuning)
         #[arg(long)]
         model: Option<String>,
-        /// Jednorázově přebij listen.language ("cs", "en", "auto")
+        /// One-off override of listen.language ("cs", "en", "auto")
         #[arg(long)]
         language: Option<String>,
-        /// Jednorázově přebij listen.device (PulseAudio source)
+        /// One-off override of listen.device (PulseAudio source)
         #[arg(long)]
         device: Option<String>,
-        /// Stáhni nakonfigurovaný whisper model a skonči
+        /// Download the configured whisper model, then exit
         #[arg(long)]
         download_model: bool,
     },
-    /// Řekne text nahlas (ElevenLabs TTS, česky); bez textu čte stdin
+    /// Speaks text aloud (ElevenLabs TTS, Czech); reads stdin if no text given
     Say {
-        /// Text k přečtení (víc argumentů se spojí mezerou)
+        /// Text to read aloud (multiple args are joined with a space)
         text: Vec<String>,
-        /// Jednorázově přebij speak.voice_id (jen ElevenLabs, bez fallbacku)
+        /// One-off override of speak.voice_id (ElevenLabs only, no fallback)
         #[arg(long)]
         voice: Option<String>,
-        /// Ulož audio do souboru místo přehrání (ElevenLabs: mp3, piper: wav)
+        /// Save audio to a file instead of playing it (ElevenLabs: mp3, piper: wav)
         #[arg(long)]
         out: Option<String>,
-        /// Vynech cache — vždy syntetizuj znovu (u ElevenLabs spálí kredity)
+        /// Skip the cache — always resynthesize (burns credits on ElevenLabs)
         #[arg(long)]
         no_cache: bool,
-        /// Vynuť lokální syntézu (piper) — ElevenLabs se vůbec nevolá
+        /// Force local synthesis (piper) — ElevenLabs is never called
         #[arg(long, conflicts_with = "voice")]
         local: bool,
-        /// Stáhni piper hlas z configu (speak.piper_voice) a skonči
+        /// Download the piper voice from config (speak.piper_voice), then exit
         #[arg(long)]
         download_model: bool,
-        /// Vypiš hlasy v účtu a skonči (vyžaduje klíč s voices_read)
+        /// List voices on the account, then exit (requires a key with voices_read)
         #[arg(long)]
         list_voices: bool,
     },
-    /// Zeptej se Jarvise textem (stejná smyčka jako hlasový dialog, bez mikrofonu)
+    /// Ask Jarvis via text (same loop as the voice dialog, no mic)
     Converse {
-        /// Otázka; bez zadání čte stdin
+        /// Question; reads stdin if not given
         text: Vec<String>,
-        /// Jen vypiš odpověď, nemluv
+        /// Just print the answer, don't speak
         #[arg(long)]
         mute: bool,
     },
-    /// Kill-gate open-ear klasifikátoru: olabelovaný JSONL korpus → confusion matrix
+    /// Kill-gate for the open-ear classifier: labeled JSONL corpus → confusion matrix
     ConverseEval {
-        /// JSONL korpus {"text","label"} (label = directed|human|background)
+        /// JSONL corpus {"text","label"} (label = directed|human|background)
         file: Option<std::path::PathBuf>,
-        /// Místo vyhodnocení vypiš šablonu korpusu z posledních N mic promluv
+        /// Instead of evaluating, print a corpus template from the last N mic utterances
         #[arg(long, value_name = "N")]
         from_db: Option<usize>,
     },
-    /// Připojí Jarvise do Google Meet jako hlasového účastníka (foreground; Ctrl-C ukončí)
+    /// Joins Jarvis into Google Meet as a voice participant (foreground; Ctrl-C to quit)
     Meet {
-        /// URL hovoru, např. https://meet.google.com/abc-defg-hij
+        /// Call URL, e.g. https://meet.google.com/abc-defg-hij
         url: String,
     },
-    /// Vše v jednom procesu: capture + poslech + hodinová analýza + denní digest (bez systemd)
+    /// Everything in one process: capture + listen + hourly analysis + daily digest (no systemd)
     Run,
-    /// Extrakce aktivity za uplynulé období (spouštět každou hodinu)
+    /// Extracts activity for the elapsed period (run hourly)
     Analyze {
-        /// Jen vypiš, co by se analyzovalo — bez volání Claude a bez zápisu
+        /// Just print what would be analyzed — no Claude call, no writes
         #[arg(long)]
         dry_run: bool,
-        /// Zpracuj posledních N hodin místo od watermarky
+        /// Process the last N hours instead of from the watermark
         #[arg(long)]
         window_hours: Option<u64>,
     },
-    /// Sestaví (a případně odešle) denní digest
+    /// Builds (and optionally sends) the daily digest
     Digest {
-        /// Datum YYYY-MM-DD (výchozí dnes)
+        /// Date YYYY-MM-DD (default: today)
         #[arg(long)]
         date: Option<String>,
-        /// Odešli e-mailem přes SendGrid
+        /// Send by email via SendGrid (respects an already-sent digest)
         #[arg(long)]
         send: bool,
-        /// Ulož HTML k náhledu, nic neposílej
+        /// Resend even a digest already sent today (otherwise a sent one is skipped)
+        #[arg(long, requires = "send")]
+        resend: bool,
+        /// Save HTML for preview, send nothing
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pošle testovací e-mail (ověření SendGrid)
+    /// Sends a test email (verifies SendGrid)
     SendTest,
-    /// Pošle SMS přes Twilio (výchozí příjemce sms.to z configu)
+    /// Sends an SMS via Twilio (default recipient sms.to from config)
     Sms {
-        /// Text zprávy; bez zadání čte stdin
+        /// Message text; reads stdin if not given
         text: Vec<String>,
-        /// Příjemce v E.164 (+420…); přebíjí sms.to
+        /// Recipient in E.164 (+420…); overrides sms.to
         #[arg(long)]
         to: Option<String>,
-        /// Nečekat na doručenku — jen odeslat a vypsat SID
+        /// Don't wait for the delivery receipt — just send and print the SID
         #[arg(long)]
         no_wait: bool,
     },
-    /// Pozastaví snímání, např. `jarvis pause 30m`
+    /// Pauses capture, e.g. `jarvis pause 30m`
     Pause { duration: String },
-    /// Obnoví snímání
+    /// Resumes capture
     Resume,
-    /// Stav: poslední vzorek, dnešní útrata, digest…
+    /// Emergency hard stop: stops systemd units and sends SIGTERM to running daemons
+    Kill {
+        /// Don't touch systemd units, just signal foreground processes
+        #[arg(long)]
+        no_units: bool,
+        /// After SIGTERM, wait and SIGKILL unresponsive processes
+        #[arg(long)]
+        force: bool,
+    },
+    /// Status: last sample, today's spend, digest…
     Status,
-    /// Kontrola prostředí a prerekvizit
+    /// Checks environment and prerequisites
     Doctor {
-        /// Živé kontroly (SendGrid sandbox send, claude ping) — stojí pár tokenů
+        /// Live checks (SendGrid sandbox send, claude ping) — costs a few tokens
         #[arg(long)]
         live: bool,
     },
-    /// Smaže screenshoty starší než zadané období
+    /// Deletes screenshots older than the given period
     Purge {
         #[arg(long, default_value = "7d")]
         older_than: String,
     },
-    /// Nainstaluje a aktivuje systemd user units
+    /// Installs and activates systemd user units
     InstallUnits {
-        /// Jen vypiš obsah units, nic neinstaluj
+        /// Just print the unit contents, install nothing
         #[arg(long)]
         print: bool,
     },
-    /// Ovládání oken, klávesnice a myši (X11) — používá i hlasový Jarvis
+    /// Window, keyboard, and mouse control (X11) — also used by voice Jarvis
     Wm {
         #[command(subcommand)]
         cmd: wm::WmCmd,
     },
-    /// Automatizační vzory: výpis a generování návrhů
+    /// Automation patterns: listing and generating proposals
     Propose {
-        /// ID vzoru (viz --list); bez zadání vezme nejčastější kandidátní vzor
+        /// Pattern ID (see --list); defaults to the most frequent candidate pattern
         #[arg(long)]
         pattern: Option<i64>,
-        /// Vypiš detekované vzory
+        /// List detected patterns
         #[arg(long)]
         list: bool,
     },
-    /// Schválené automatizace (fáze D): schvalování, spouštění, historie
+    /// Approved automations (phase D): approval, execution, history
     Runbook {
         #[command(subcommand)]
         cmd: runbook::RunbookCmd,
     },
+    /// Scheduled internal tasks: dependency self-management and maintenance (list, run, schedule)
+    Tasks {
+        #[command(subcommand)]
+        cmd: tasks::TasksCmd,
+    },
+    /// Long-term memory: facts about the master (list, search, add, consolidate)
+    Memory {
+        #[command(subcommand)]
+        cmd: memory::MemoryCmd,
+    },
+    /// Proactive layer: one tick (detection → nudge); --dry-run just prints
+    Nudge {
+        /// Just show what the layer would do now — no API, writes, speech, or Telegram
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Kill-gate for the proactive classifier: labeled JSONL → false-interrupt rate
+    NudgeEval {
+        /// JSONL corpus {"evidence","label"} (label = worth|noise)
+        file: Option<std::path::PathBuf>,
+        /// Instead of evaluating, print a corpus template from the last N mic utterances
+        #[arg(long, value_name = "N")]
+        from_db: Option<usize>,
+    },
+    /// Kill-gate for the reprompt gate (clean, free): labeled JSONL → false-reject rate
+    RepromptEval {
+        /// JSONL corpus {"text","label"} (label = real|junk)
+        file: Option<std::path::PathBuf>,
+        /// Instead of evaluating, print a template from the last N real questions (conversations)
+        #[arg(long, value_name = "N")]
+        from_db: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
-    // CLI chování: `jarvis status | head` nesmí panikařit na broken pipe
+    // CLI behavior: `jarvis status | head` must not panic on broken pipe
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -224,14 +272,14 @@ fn main() -> Result<()> {
             if let Some(d) = device {
                 cfg.listen.device = d;
             }
-            cfg.validate()?; // přebité hodnoty (--engine/--language/--model) taky ověř
+            cfg.validate()?; // also validate overridden values (--engine/--language/--model)
             if download_model {
                 listen::download(&paths, &cfg)
             } else if let Some(w) = wav {
                 listen::run_wav(&paths, &cfg, std::path::Path::new(&w))
             } else {
-                // démon píše do stdin warm procesu — EPIPE nesmí zabít proces
-                // (SIG_DFL výš je kvůli CLI rourám typu `jarvis status | head`)
+                // the daemon writes to the warm process's stdin — EPIPE must not kill it
+                // (the SIG_DFL above is for CLI pipes like `jarvis status | head`)
                 unsafe {
                     libc::signal(libc::SIGPIPE, libc::SIG_IGN);
                 }
@@ -296,8 +344,8 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                // stejná streamovaná cesta jako hlasový démon (warm + průběžná
-                // syntéza po větách); --mute jen tiskne věty s časem místo mluvení
+                // same streamed path as the voice daemon (warm + incremental
+                // synthesis per sentence); --mute just prints sentences with timing instead of speaking
                 let answer = converse::converse_cli(&paths, &cfg, &conn, question.trim(), mute)?;
                 println!("{answer}");
             }
@@ -314,7 +362,7 @@ fn main() -> Result<()> {
         }
         Cmd::Meet { url } => meet::run_meet(&paths, &cfg, &url),
         Cmd::Run => {
-            // stejný důvod jako u `listen`: warm claude v konverzačním workeru
+            // same reason as `listen`: warm claude in the conversation worker
             unsafe {
                 libc::signal(libc::SIGPIPE, libc::SIG_IGN);
             }
@@ -324,7 +372,7 @@ fn main() -> Result<()> {
             let conn = store::db::open(&paths.db_path)?;
             pipeline::analyze::run(&paths, &cfg, &conn, dry_run, window_hours)
         }
-        Cmd::Digest { date, send, dry_run } => {
+        Cmd::Digest { date, send, resend, dry_run } => {
             let conn = store::db::open(&paths.db_path)?;
             let d = match date {
                 Some(s) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
@@ -340,11 +388,18 @@ fn main() -> Result<()> {
                 println!("─── Markdown ───");
                 println!("{md}");
             } else if send {
-                if digest::send_stored(&paths, &cfg, &conn, &date_str, true)? {
+                // NOTE: scheduled send (systemd digest.timer, `digest --send`) MUST NOT
+                // force — force bypasses idempotency via the `sent` status, and racing
+                // with the hourly retry_pending would send the digest twice. Force only
+                // on explicit `--resend` (a deliberate resend of an already-sent digest).
+                if digest::send_stored(&paths, &cfg, &conn, &date_str, resend)? {
                     println!("Digest {date_str} odeslán na {}.", cfg.email.to);
                     speak::announce(&paths, &cfg, speak::DIGEST_ANNOUNCEMENT);
                 } else {
-                    println!("Digest {date_str} právě odesílá jiný proces — neodesílám podruhé.");
+                    println!(
+                        "Digest {date_str} se neodeslal — už je odeslaný (přeposlat: \
+                         `jarvis digest --send --resend`), nebo ho právě posílá jiný proces."
+                    );
                 }
             } else {
                 println!(
@@ -428,6 +483,7 @@ fn main() -> Result<()> {
             println!("Snímání obnoveno.");
             Ok(())
         }
+        Cmd::Kill { no_units, force } => kill::run(no_units, force),
         Cmd::Status => status::status(&paths, &cfg),
         Cmd::Doctor { live } => status::doctor(&paths, &cfg, live),
         Cmd::Purge { older_than } => {
@@ -450,6 +506,41 @@ fn main() -> Result<()> {
         Cmd::Runbook { cmd } => {
             let conn = store::db::open(&paths.db_path)?;
             runbook::cli(&paths, &cfg, &conn, cmd)
+        }
+        Cmd::Tasks { cmd } => {
+            let conn = store::db::open(&paths.db_path)?;
+            tasks::cli(&paths, &cfg, &conn, cmd)
+        }
+        Cmd::Memory { cmd } => {
+            let conn = store::db::open(&paths.db_path)?;
+            memory::cli(&paths, &cfg, &conn, cmd)
+        }
+        Cmd::Nudge { dry_run } => {
+            let conn = store::db::open(&paths.db_path)?;
+            if dry_run {
+                nudge::run_dry(&paths, &cfg, &conn)
+            } else {
+                nudge::tick(&paths, &cfg, &conn);
+                Ok(())
+            }
+        }
+        Cmd::NudgeEval { file, from_db } => {
+            if let Some(n) = from_db {
+                nudge::eval_scaffold(&paths, n)
+            } else if let Some(f) = file {
+                nudge::eval(&paths, &cfg, &f)
+            } else {
+                anyhow::bail!("zadej JSONL korpus, nebo --from-db N pro šablonu")
+            }
+        }
+        Cmd::RepromptEval { file, from_db } => {
+            if let Some(n) = from_db {
+                converse::eval_reprompt_scaffold(&paths, n)
+            } else if let Some(f) = file {
+                converse::eval_reprompt(&paths, &cfg, &f)
+            } else {
+                anyhow::bail!("zadej JSONL korpus, nebo --from-db N pro šablonu")
+            }
         }
     }
 }

@@ -1,11 +1,12 @@
-//! Schvalování runbooků na dálku přes Telegram bota (PLAN §9, fáze D).
+//! Remote runbook approval via Telegram bot (PLAN §9, phase D).
 //!
-//! Bot API `getUpdates` bez čekání — polluje ho 5min otočka plánovače
-//! (`runbook run-due` / `jarvis run`), takže funguje za NAT bez webhooku.
-//! Model důvěry: bot je Danielův vlastní (token v secrets.env) a poslouchá
-//! se JEDINÝ chat (`TELEGRAM_CHAT_ID` = soukromý chat pána s botem);
-//! zprávy odjinud se ignorují a logují. Schválení = „schval N“, zamítnutí
-//! = „zamítni N“. Nové návrhy bot ohlašuje sám.
+//! Bot API `getUpdates` without long-polling — polled by the scheduler's
+//! 5-min tick (`runbook run-due` / `jarvis run`), so it works behind NAT
+//! without a webhook. Trust model: the bot is Daniel's own (token in
+//! secrets.env) and listens to a SINGLE chat (`TELEGRAM_CHAT_ID` = the
+//! owner's private chat with the bot); messages from elsewhere are ignored
+//! and logged. Approve = "schval N", reject = "zamítni N". The bot
+//! announces new proposals itself.
 
 use crate::config::{self, Config, Paths};
 use crate::store::db;
@@ -18,10 +19,11 @@ use tracing::{debug, info, warn};
 
 const API: &str = "https://api.telegram.org";
 
-/// Chyba ureq BEZ URL — ta u Telegramu obsahuje `bot<token>` a ureq ji dává
-/// do Display u Status i Transport chyb, takže `{e:#}` v logu jinak vypíše
-/// token. Bereme jen stavový kód / druh chyby a (u Status) tělo odpovědi,
-/// které token neobsahuje.
+/// ureq error WITHOUT the URL — Telegram's URL contains `bot<token>`, and
+/// ureq puts it in the Display impl for both Status and Transport errors,
+/// so `{e:#}` in a log would otherwise leak the token. We keep only the
+/// status code/error kind and (for Status) the response body, which
+/// doesn't contain the token.
 fn ureq_err(what: &str, e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -34,8 +36,9 @@ fn ureq_err(what: &str, e: ureq::Error) -> anyhow::Error {
     }
 }
 
-/// Pošle zprávu do chatu; chyby vrací (volající loguje — notifikace jsou
-/// best-effort, schvalovací odpovědi chceme vidět v logu).
+/// Sends a message to the chat; returns errors (the caller logs them —
+/// notifications are best-effort, but we want approval replies visible in
+/// the log).
 pub fn send_message(token: &str, chat_id: &str, text: &str) -> Result<()> {
     let resp = ureq::post(&format!("{API}/bot{token}/sendMessage"))
         .timeout(Duration::from_secs(15))
@@ -91,9 +94,10 @@ pub(crate) fn parse_updates(v: &Value) -> Vec<Update> {
         .unwrap_or_default()
 }
 
-/// „schval 3“ / „zamítni 3“ → (approve?, proposal_id). Toleruje velikost
-/// písmen, diakritiku v „zamítni“, lomítkový tvar „/schval_3“ i „schval #3“.
-/// Bez čísla návrhu nic — samotné „ano“ nesmí nikdy nic schválit.
+/// "schval 3" / "zamítni 3" → (approve?, proposal_id). Tolerates case,
+/// diacritics in "zamítni", the slash form "/schval_3", and "schval #3".
+/// Without a proposal number, nothing — a bare "ano" must never approve
+/// anything.
 pub(crate) fn parse_command(text: &str) -> Option<(bool, i64)> {
     let t = text.to_lowercase().replace('í', "i");
     let mut tokens = t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty());
@@ -105,7 +109,7 @@ pub(crate) fn parse_command(text: &str) -> Option<(bool, i64)> {
     Some((approve, tokens.next()?.parse().ok()?))
 }
 
-/// Ohlásí nový návrh do chatu (best-effort; vypnuto/nenakonfigurováno = ticho).
+/// Announces a new proposal to the chat (best-effort; off/unconfigured = silent).
 pub fn notify_proposal(paths: &Paths, cfg: &Config, proposal_id: i64, kind: &str, desc: &str) {
     if !cfg.runbooks.telegram_approve {
         return;
@@ -126,11 +130,16 @@ pub fn notify_proposal(paths: &Paths, cfg: &Config, proposal_id: i64, kind: &str
     }
 }
 
-/// Vyřídí čekající schvalovací zprávy. Volá se z otočky plánovače; všechny
-/// chyby jen loguje (plánovač nesmí spadnout kvůli síti). Offset se posouvá
-/// i přes nesrozumitelné zprávy — nic se nevyřizuje dvakrát.
+/// Processes pending approval messages. Called from the scheduler's tick;
+/// all errors are just logged (the scheduler must not crash over a network
+/// issue). The offset advances even past unintelligible messages — nothing
+/// gets processed twice.
 pub fn process_approvals(paths: &Paths, cfg: &Config, conn: &Connection) {
-    if !cfg.runbooks.telegram_approve {
+    // One getUpdates stream carries two command families: runbook approvals
+    // ("schval N"/"zamítni N") and proactive confirmations ("ano N"/"ne N").
+    // Polling only runs when at least one of them has remote work to do.
+    let nudge_confirm = cfg.proactive.enabled && cfg.proactive.telegram_confirm;
+    if !cfg.runbooks.telegram_approve && !nudge_confirm {
         return;
     }
     let Ok((token, chat_id)) = config::telegram_keys(paths) else {
@@ -163,31 +172,43 @@ pub fn process_approvals(paths: &Paths, cfg: &Config, conn: &Connection) {
             );
             continue;
         }
-        let Some((approve, proposal_id)) = parse_command(text) else {
+        let reply = if let Some((approve, proposal_id)) = parse_command(text) {
+            if !cfg.runbooks.telegram_approve {
+                debug!("telegram: schvalování runbooků vypnuté — ignoruji: {}", util::truncate_chars(text, 80));
+                continue;
+            }
+            if approve {
+                match crate::runbook::approve(conn, proposal_id, "manual", None, "telegram") {
+                    Ok(rb) => {
+                        info!("telegram: návrh #{proposal_id} schválen → runbook #{}", rb.id);
+                        format!(
+                            "✓ Runbook #{} „{}“ schválen (plán manual — spustí se \
+                             ručně nebo hlasem; denní plán: jarvis runbook schedule \
+                             {} daily@HH:MM)",
+                            rb.id, rb.name, rb.id
+                        )
+                    }
+                    Err(e) => format!("✗ Schválení #{proposal_id} selhalo: {e:#}"),
+                }
+            } else {
+                match crate::runbook::dismiss(conn, proposal_id) {
+                    Ok(_) => {
+                        info!("telegram: návrh #{proposal_id} zamítnut");
+                        format!("✓ Návrh #{proposal_id} zamítnut.")
+                    }
+                    Err(e) => format!("✗ Zamítnutí #{proposal_id} selhalo: {e:#}"),
+                }
+            }
+        } else if let Some((yes, nudge_id)) = crate::nudge::parse_confirm(text) {
+            if !nudge_confirm {
+                debug!("telegram: proaktivní potvrzení vypnuté — ignoruji: {}", util::truncate_chars(text, 80));
+                continue;
+            }
+            info!("telegram: proaktivní potvrzení #{nudge_id} = {}", if yes { "ano" } else { "ne" });
+            crate::nudge::confirm_remote(paths, cfg, conn, nudge_id, yes)
+        } else {
             debug!("telegram: nerozumím zprávě: {}", util::truncate_chars(text, 80));
             continue;
-        };
-        let reply = if approve {
-            match crate::runbook::approve(conn, proposal_id, "manual", None, "telegram") {
-                Ok(rb) => {
-                    info!("telegram: návrh #{proposal_id} schválen → runbook #{}", rb.id);
-                    format!(
-                        "✓ Runbook #{} „{}“ schválen (plán manual — spustí se \
-                         ručně nebo hlasem; denní plán: jarvis runbook schedule \
-                         {} daily@HH:MM)",
-                        rb.id, rb.name, rb.id
-                    )
-                }
-                Err(e) => format!("✗ Schválení #{proposal_id} selhalo: {e:#}"),
-            }
-        } else {
-            match crate::runbook::dismiss(conn, proposal_id) {
-                Ok(_) => {
-                    info!("telegram: návrh #{proposal_id} zamítnut");
-                    format!("✓ Návrh #{proposal_id} zamítnut.")
-                }
-                Err(e) => format!("✗ Zamítnutí #{proposal_id} selhalo: {e:#}"),
-            }
         };
         if let Err(e) = send_message(&token, &chat_id, &reply) {
             warn!("telegram: odpověď se neodeslala: {e:#}");
@@ -208,14 +229,14 @@ mod tests {
     fn command_parsing_accepts_human_variants() {
         assert_eq!(parse_command("schval 3"), Some((true, 3)));
         assert_eq!(parse_command("SCHVAL 3"), Some((true, 3)));
-        assert_eq!(parse_command("Schválit 12"), None); // diakritika v kmeni ne — á≠a
+        assert_eq!(parse_command("Schválit 12"), None); // diacritics in the stem don't match — á≠a
         assert_eq!(parse_command("schvalit 12"), Some((true, 12)));
         assert_eq!(parse_command("/schval_7"), Some((true, 7)));
         assert_eq!(parse_command("schval #4"), Some((true, 4)));
         assert_eq!(parse_command("zamítni 5"), Some((false, 5)));
         assert_eq!(parse_command("zamitni 5"), Some((false, 5)));
         assert_eq!(parse_command("Zamítnout 9"), Some((false, 9)));
-        // bez čísla, cizí slova, prázdno → nic
+        // no number, foreign words, empty → nothing
         assert_eq!(parse_command("schval"), None);
         assert_eq!(parse_command("ano"), None);
         assert_eq!(parse_command("ahoj jak je"), None);
@@ -239,7 +260,7 @@ mod tests {
         assert_eq!(ups[0].chat_id, Some(42));
         assert_eq!(ups[0].text.as_deref(), Some("schval 1"));
         assert_eq!(ups[1].chat_id, Some(99));
-        // update bez message → prázdné, ale update_id se počítá (offset!)
+        // update without a message → empty, but update_id still counts (offset!)
         assert_eq!(ups[2].update_id, 12);
         assert_eq!(ups[2].chat_id, None);
         assert_eq!(ups[2].text, None);

@@ -18,13 +18,13 @@ pub struct Pattern {
     pub status: String,
 }
 
-/// Uloží automation_hints z hodinové analýzy; stejný (normalizovaný) hint
-/// zvyšuje occurrences — opakování = signál pro automatizaci.
+/// Stores automation_hints from the hourly analysis; the same (normalized)
+/// hint bumps occurrences — repetition is a signal for automation.
 pub fn record_hints(conn: &Connection, hints: &[String]) -> Result<()> {
     let now = crate::util::now_ts();
     for h in hints {
         let desc = h.trim();
-        // příliš krátké hinty jsou šum
+        // hints that are too short are noise
         if desc.chars().count() < 8 {
             continue;
         }
@@ -65,7 +65,7 @@ fn row_to_pattern(r: &rusqlite::Row) -> rusqlite::Result<Pattern> {
 
 const COLS: &str = "id, description, occurrences, first_seen, last_seen, status";
 
-/// Vzory s min. počtem výskytů (pro digest sekci Automatizační příležitosti).
+/// Patterns with at least min_occurrences (for the digest's Automation opportunities section).
 pub fn top(conn: &Connection, min_occurrences: i64, limit: usize) -> Result<Vec<Pattern>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM patterns
@@ -98,7 +98,7 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Pattern>> {
     .map_err(Into::into)
 }
 
-/// Nejčastější kandidátní vzor (pro `jarvis propose` bez argumentu).
+/// Most frequent candidate pattern (for `jarvis propose` with no argument).
 pub fn best_candidate(conn: &Connection) -> Result<Option<Pattern>> {
     conn.query_row(
         &format!(
@@ -117,7 +117,7 @@ pub fn set_status(conn: &Connection, id: i64, status: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------- fáze C: generování návrhů automatizace ----------
+// ---------- phase C: generating automation proposals ----------
 
 #[derive(Debug, Deserialize)]
 struct ProposalJson {
@@ -153,9 +153,9 @@ pub fn print_list(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Vygeneruje artefakt automatizace pro vzor (výchozí: nejčastější kandidát)
-/// do proposals/, označí vzor jako `proposed` a ohlásí ho na nakonfigurované
-/// kanály (Telegram/SMS — schvalování na dálku).
+/// Generates an automation artifact for a pattern (default: most frequent
+/// candidate) into proposals/, marks the pattern `proposed`, and announces it
+/// on the configured channels (Telegram/SMS — remote approval).
 pub fn propose(paths: &Paths, cfg: &Config, conn: &Connection, id: Option<i64>) -> Result<()> {
     let pat = match id {
         Some(i) => get(conn, i)?.with_context(|| format!("vzor #{i} neexistuje (viz --list)"))?,
@@ -186,7 +186,7 @@ pub fn propose(paths: &Paths, cfg: &Config, conn: &Connection, id: Option<i64>) 
     );
     let outcome = claude::run(&ClaudeRequest {
         prompt,
-        model: None, // kvalita > cena; default model claude CLI
+        model: None, // quality over cost; default claude CLI model
         cwd: &paths.data_dir,
         allowed_tools: "Read",
         max_turns: 3,
@@ -260,7 +260,7 @@ mod tests {
         let conn = db::test_conn();
         record_hints(&conn, &["Ruční kopírování dat z A do B".into()]).unwrap();
         record_hints(&conn, &["ruční  kopírování dat z a do b".into()]).unwrap();
-        record_hints(&conn, &["krátké".into()]).unwrap(); // šum — zahozen
+        record_hints(&conn, &["krátké".into()]).unwrap(); // noise — discarded
         let pats = all(&conn).unwrap();
         assert_eq!(pats.len(), 1);
         assert_eq!(pats[0].occurrences, 2);

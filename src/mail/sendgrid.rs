@@ -23,7 +23,7 @@ fn payload(
         "personalizations": [{"to": [{"email": cfg.to}]}],
         "from": {"email": cfg.from, "name": cfg.from_name},
         "subject": subject,
-        // SendGrid vyžaduje text/plain před text/html
+        // SendGrid requires text/plain before text/html
         "content": [
             {"type": "text/plain", "value": text},
             {"type": "text/html", "value": html}
@@ -35,8 +35,8 @@ fn payload(
     v
 }
 
-/// Odešle e-mail; retry s backoffem na 429/5xx/transport chyby.
-/// Vrací SendGrid X-Message-Id, pokud ho server poslal.
+/// Sends an email; retries with backoff on 429/5xx/transport errors.
+/// Returns the SendGrid X-Message-Id, if the server sent one.
 pub fn send(
     cfg: &EmailCfg,
     api_key: &str,
@@ -47,7 +47,7 @@ pub fn send(
     send_inner(cfg, api_key, subject, text, html, false)
 }
 
-/// Sandbox mód: SendGrid požadavek zvaliduje (klíč, odesílatel), ale nic neodešle.
+/// Sandbox mode: SendGrid validates the request (key, sender) but sends nothing.
 pub fn sandbox_check(cfg: &EmailCfg, api_key: &str) -> Result<()> {
     send_inner(cfg, api_key, "Jarvis sandbox check", "test", "<p>test</p>", true).map(|_| ())
 }

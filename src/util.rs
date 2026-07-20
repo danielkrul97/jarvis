@@ -27,7 +27,7 @@ pub fn today_local() -> NaiveDate {
     Local::now().date_naive()
 }
 
-/// (start, end) epochy lokálního dne; end je exkluzivní (půlnoc dalšího dne).
+/// (start, end) epoch of the local day; end is exclusive (midnight the next day).
 pub fn day_bounds_local(date: NaiveDate) -> Result<(i64, i64)> {
     let start_naive = date.and_hms_opt(0, 0, 0).context("neplatné datum")?;
     let next = date.succ_opt().context("datum mimo rozsah")?;
@@ -43,7 +43,7 @@ pub fn day_bounds_local(date: NaiveDate) -> Result<(i64, i64)> {
     Ok((start.timestamp(), end.timestamp()))
 }
 
-/// Relativní umístění screenshotu v shots/: (podadresář data, název souboru).
+/// Relative location of a screenshot under shots/: (date subdirectory, file name).
 pub fn shot_rel_path(ts: i64) -> (String, String) {
     match Local.timestamp_opt(ts, 0) {
         chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => (
@@ -54,7 +54,7 @@ pub fn shot_rel_path(ts: i64) -> (String, String) {
     }
 }
 
-/// Velikost adresáře rekurzivně (bytes, počet souborů). Chyby čtení přeskakuje.
+/// Recursive directory size (bytes, file count). Read errors are skipped.
 pub fn dir_size(path: &std::path::Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut files = 0u64;
@@ -75,8 +75,8 @@ pub fn dir_size(path: &std::path::Path) -> (u64, u64) {
     (bytes, files)
 }
 
-/// Stáhne URL do `target`: streamovaně, atomicky přes `.part`, s kontrolou
-/// Content-Length a logem průběhu. Existující soubor se nestahuje znovu.
+/// Downloads a URL to `target`: streamed, atomic via `.part`, with
+/// Content-Length verification and progress logging. An existing file is not re-downloaded.
 pub fn download(url: &str, target: &std::path::Path) -> Result<()> {
     use std::io::{Read, Write};
     use tracing::info;
@@ -129,7 +129,7 @@ pub fn download(url: &str, target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Ořízne řetězec na max_chars znaků, s výpustkou.
+/// Truncates a string to max_chars characters, with an ellipsis.
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -139,9 +139,9 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// SHA-256 (FIPS 180-4). Jediné použití je otisk artefaktu runbooku při
-/// schválení (ověří se před každou exekucí), závislost by byla zbytečná —
-/// stejně jako ruční base64 v sms.rs.
+/// SHA-256 (FIPS 180-4). Its only use is hashing a runbook artifact at
+/// approval time (verified before every execution); a dependency would be
+/// overkill — same rationale as the hand-rolled base64 in sms.rs.
 #[allow(clippy::needless_range_loop)]
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
@@ -257,7 +257,7 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        // kanonický 56B vektor — délka vynutí druhý blok při paddingu
+        // canonical 56B vector — length forces a second padding block
         assert_eq!(
             sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"

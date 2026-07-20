@@ -12,8 +12,9 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Exkluzivní flock proti dvojímu snímání (systemd služba × ruční `capture`
-/// × `jarvis run`). Zámek drží vrácený File — volající ho musí držet při životě.
+/// Exclusive flock against double capture (systemd service × manual `capture`
+/// × `jarvis run`). The lock is held by the returned File — the caller must
+/// keep it alive.
 pub fn acquire_lock(paths: &Paths) -> Result<std::fs::File> {
     let path = paths.data_dir.join("capture.lock");
     let f = std::fs::OpenOptions::new()
@@ -32,7 +33,7 @@ pub fn acquire_lock(paths: &Paths) -> Result<std::fs::File> {
     Ok(f)
 }
 
-/// Snímací démon: běží ve smyčce, dokud ho něco nezabije (systemd, Ctrl-C).
+/// Capture daemon: runs in a loop until something kills it (systemd, Ctrl-C).
 pub fn run_capture(paths: &Paths, cfg: &Config) -> Result<()> {
     let bl = Blacklist::new(&cfg.capture)?;
     let conn = db::open(&paths.db_path)?;
@@ -79,18 +80,18 @@ fn step(
     last_phash: &mut Option<u64>,
 ) -> Result<()> {
     let now = util::now_ts();
-    // Soukromí: během pauzy se neukládá VŮBEC NIC — ani titulky oken.
+    // Privacy: during pause, NOTHING gets stored — not even window titles.
     if db::pause_until(conn, now)?.is_some() {
         return Ok(());
     }
-    // Levná sonda spojení — jinak by mrtvé X (metadata chyby se maskují)
-    // vyšlo najevo až při dalším screenshotu.
+    // Cheap connection probe — otherwise a dead X connection (metadata
+    // errors are masked) would only surface at the next screenshot.
     x.probe()?;
 
     let info = x.active_window_info();
     let idle_ms = x.idle_ms() as i64;
     let blacklisted = bl.matches(&info.wm_class, &info.title);
-    // U blacklistovaných oken neukládáme ani titulek — jen třídu okna.
+    // For blacklisted windows we don't store even the title — just the window class.
     let title = if blacklisted { "[blacklisted]".to_string() } else { info.title };
 
     let mut shot_path: Option<String> = None;
@@ -129,7 +130,7 @@ fn step(
     Ok(())
 }
 
-/// Zmenší obraz tak, aby delší strana byla max `max_dim`.
+/// Downscales the image so the longer side is at most `max_dim`.
 fn downscale(img: RgbImage, max_dim: u32) -> RgbImage {
     let (w, h) = img.dimensions();
     let longer = w.max(h);
@@ -142,7 +143,7 @@ fn downscale(img: RgbImage, max_dim: u32) -> RgbImage {
     imageops::resize(&img, nw, nh, FilterType::Triangle)
 }
 
-/// Uloží JPEG do shots/YYYY-MM-DD/HHMMSS.jpg; vrací cestu relativní k data_dir.
+/// Saves a JPEG to shots/YYYY-MM-DD/HHMMSS.jpg; returns the path relative to data_dir.
 fn save_shot(img: &RgbImage, paths: &Paths, ts: i64) -> Result<String> {
     let (day, file) = util::shot_rel_path(ts);
     let dir = paths.shots_dir.join(&day);
@@ -157,7 +158,7 @@ fn save_shot(img: &RgbImage, paths: &Paths, ts: i64) -> Result<String> {
     Ok(format!("shots/{day}/{file}"))
 }
 
-/// Hodinové úklidové práce (retence) — chyby jen loguje, démon běží dál.
+/// Hourly housekeeping (retention) — errors are just logged, the daemon keeps running.
 fn housekeeping(conn: &Connection, paths: &Paths, cfg: &Config) {
     let now = util::now_ts();
     let last = db::state_get_i64(conn, "last_purge").ok().flatten().unwrap_or(0);

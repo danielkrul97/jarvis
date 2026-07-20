@@ -19,12 +19,13 @@ pub struct DayData {
     pub patterns: Vec<Pattern>,
     pub runbook_runs: Vec<crate::runbook::RunRow>,
     pub pending_proposals: usize,
+    pub task_runs: Vec<crate::tasks::TaskRun>,
     pub cost_usd: f64,
 }
 
-/// Sestaví digest pro daný den a vrátí (markdown, html). S `persist` ho uloží
-/// do DB (status pending → doručovací smyčka ho odešle); dry-run persist
-/// nesmí, jinak by se náhled později odeslal sám.
+/// Builds the digest for the given day and returns (markdown, html). With
+/// `persist`, stores it in the DB (status pending → the delivery loop sends
+/// it); a dry-run must not persist, or the preview would later send itself.
 pub fn build(
     paths: &Paths,
     cfg: &Config,
@@ -59,6 +60,7 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
     let pats = patterns::top(conn, 2, 8)?;
     let runbook_runs = crate::runbook::runs_between(conn, from, to)?;
     let pending_proposals = crate::runbook::pending_proposals(conn)?.len();
+    let task_runs = crate::tasks::runs_between(conn, from, to)?;
     let cost_usd = db::cost_between(conn, from, to)?;
     Ok(DayData {
         date,
@@ -68,6 +70,7 @@ fn collect(cfg: &Config, conn: &Connection, date: NaiveDate) -> Result<DayData> 
         patterns: pats,
         runbook_runs,
         pending_proposals,
+        task_runs,
         cost_usd,
     })
 }
@@ -123,7 +126,7 @@ fn generate_via_claude(
     Ok(md.to_string())
 }
 
-/// Deterministická kostra: vždy k dispozici, slouží i jako fallback e-mail.
+/// Deterministic skeleton: always available, also serves as the fallback email.
 pub fn deterministic_markdown(data: &DayData) -> String {
     let mut md = format!("# Jarvis digest — {}\n", data.date.format("%Y-%m-%d"));
 
@@ -208,6 +211,35 @@ pub fn deterministic_markdown(data: &DayData) -> String {
         }
     }
 
+    if !data.task_runs.is_empty() {
+        md.push_str("\n## Údržba a závislosti\n");
+        for r in &data.task_runs {
+            let state = match (r.finished_at, r.ok) {
+                (Some(_), Some(true)) => "✓",
+                (Some(_), Some(false)) => "✗ problém",
+                _ => "⚠ nedoběhl",
+            };
+            md.push_str(&format!(
+                "- {} **{}** ({}) {}\n",
+                util::fmt_hm(r.started_at),
+                r.task,
+                r.trigger,
+                state
+            ));
+        }
+        // for problems, attach the output — it carries the exact remediation command (what to install)
+        for r in data.task_runs.iter().filter(|r| r.ok == Some(false)) {
+            let detail = util::truncate_chars(r.output.trim(), 400);
+            if detail.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("\n> **{}** hlásí:\n", r.task));
+            for line in detail.lines() {
+                md.push_str(&format!("> {line}\n"));
+            }
+        }
+    }
+
     if data.degraded_count > 0 {
         md.push_str(&format!(
             "\n> {} hodinových souhrnů běželo bez Claude (rozpočet/chyba) — jen z titulků oken.\n",
@@ -243,6 +275,20 @@ fn build_prompt(data: &DayData) -> Result<String> {
             format!("- {} „{}“ ({}): {state}", util::fmt_hm(r.started_at), r.name, r.trigger)
         })
         .collect();
+    let task_txt: Vec<String> = data
+        .task_runs
+        .iter()
+        .map(|r| {
+            let state = match (r.finished_at, r.ok) {
+                (Some(_), Some(true)) => "OK".to_string(),
+                (Some(_), Some(false)) => {
+                    format!("PROBLÉM — {}", util::truncate_chars(r.output.trim(), 200))
+                }
+                _ => "nedoběhl".to_string(),
+            };
+            format!("- {} „{}“ ({}): {state}", util::fmt_hm(r.started_at), r.task, r.trigger)
+        })
+        .collect();
 
     Ok(format!(
         "Jsi Jarvis, můj osobní pracovní asistent (mluvíš česky, věcně, přátelsky, \
@@ -254,6 +300,7 @@ fn build_prompt(data: &DayData) -> Result<String> {
          Opakované vzory vhodné k automatizaci:\n{patterns}\n\n\
          Běhy schválených automatizací (runbooků) — {pending} návrhů čeká na \
          schválení:\n{runbooks}\n\n\
+         Plánované interní úlohy (samospráva závislostí a údržba):\n{tasks}\n\n\
          ÚKOL\n\
          Vrať POUZE Markdown (žádné ``` ploty, žádný text okolo), začni řádkem \
          `# Jarvis digest — {date}`. Sekce (vynech prázdné):\n\
@@ -268,6 +315,9 @@ fn build_prompt(data: &DayData) -> Result<String> {
          ## Automatizace (runbooky) — co běželo samo a jak dopadlo; selhání \
          zmiň výrazně; když čekají návrhy na schválení, připomeň \
          `jarvis runbook pending`\n\
+         ## Údržba a závislosti — JEN když nějaká plánovaná úloha narazila na \
+         problém (chybějící závislost, málo místa); uveď co chybí a přesný \
+         příkaz z hlášky. Když je vše OK, sekci úplně vynech\n\
          Buď konkrétní (názvy souborů, projektů, čísla). Žádné vymýšlení — jen co je v podkladech.",
         date = data.date.format("%Y-%m-%d"),
         timeline = timeline,
@@ -276,6 +326,7 @@ fn build_prompt(data: &DayData) -> Result<String> {
         patterns = if patterns_txt.is_empty() { "(žádné)".to_string() } else { patterns_txt.join("\n") },
         pending = data.pending_proposals,
         runbooks = if runbook_txt.is_empty() { "(žádné)".to_string() } else { runbook_txt.join("\n") },
+        tasks = if task_txt.is_empty() { "(žádné)".to_string() } else { task_txt.join("\n") },
     ))
 }
 
@@ -354,6 +405,24 @@ mod tests {
                 },
             ],
             pending_proposals: 2,
+            task_runs: vec![
+                crate::tasks::TaskRun {
+                    task: "deps".into(),
+                    started_at: 300,
+                    finished_at: Some(305),
+                    ok: Some(false),
+                    trigger: "timer".into(),
+                    output: "✗ whisper model — chybí, `jarvis listen --download-model`".into(),
+                },
+                crate::tasks::TaskRun {
+                    task: "purge-screenshots".into(),
+                    started_at: 900,
+                    finished_at: Some(901),
+                    ok: Some(true),
+                    trigger: "timer".into(),
+                    output: "odstraněno 3 snímků".into(),
+                },
+            ],
             cost_usd: 0.05,
         };
         let md = deterministic_markdown(&data);
@@ -363,6 +432,11 @@ mod tests {
         assert!(md.contains("ranní sync"));
         assert!(md.contains("✗ timeout"));
         assert!(md.contains("2 návrh(y) čekají na schválení"));
+        // scheduled tasks: section, status, and remediation output for a problem
+        assert!(md.contains("## Údržba a závislosti"));
+        assert!(md.contains("deps"));
+        assert!(md.contains("✗ problém"));
+        assert!(md.contains("jarvis listen --download-model"));
         assert!(md.contains("| vim | 1 h 0 min |"));
         assert!(md.contains("psaní kódu"));
         assert!(md.contains("rozdělaný PLAN.md"));
@@ -379,11 +453,13 @@ mod tests {
             patterns: vec![],
             runbook_runs: vec![],
             pending_proposals: 0,
+            task_runs: vec![],
             cost_usd: 0.0,
         };
         let md = deterministic_markdown(&data);
         assert!(md.contains("# Jarvis digest"));
         assert!(!md.contains("## Automatizace (runbooky)"));
+        assert!(!md.contains("## Údržba a závislosti"));
     }
 
     #[test]

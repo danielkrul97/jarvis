@@ -1,11 +1,11 @@
-//! Dedikovaný Chrome pro Google Meet + vizuální připojení do hovoru.
+//! Dedicated Chrome for Google Meet + visual join to the call.
 //!
-//! Chrome běží ve vlastním profilu (izolace od uživatelova prohlížeče) a je
-//! přes `PULSE_SINK`/`PULSE_SOURCE` napevno navázaný na Jarvisova virtuální
-//! zařízení (ověřeno v P1: samotné env stačí). Připojení do hovoru řídí
-//! vizuální agent — stejný osvědčený vzor jako converse (`jarvis wm`
-//! screenshot → Read → klik), ale s ABSOLUTNÍ cestou k běžící binárce, aby
-//! nezáleželo na PATH.
+//! Chrome runs in its own profile (isolated from the user's browser) and is
+//! hard-bound to Jarvis's virtual devices via `PULSE_SINK`/`PULSE_SOURCE`
+//! (verified in P1: env alone is enough). The call join is driven by a
+//! visual agent — the same proven pattern as converse (`jarvis wm`
+//! screenshot → Read → click), but with an ABSOLUTE path to the running
+//! binary so PATH doesn't matter.
 
 use crate::config::{Config, Paths};
 use crate::pipeline::claude::{self, ClaudeRequest};
@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tracing::info;
 
-/// Běžící dedikovaný Chrome; `Drop` ho zabije (jinak by zůstal v hovoru).
+/// Running dedicated Chrome; `Drop` kills it (otherwise it'd stay in the call).
 pub struct Chrome {
     child: Child,
     #[allow(dead_code)]
@@ -23,7 +23,7 @@ pub struct Chrome {
 }
 
 impl Chrome {
-    /// true, pokud Chrome mezitím skončil (zavřené okno / konec hovoru).
+    /// true if Chrome has exited meanwhile (window closed / call ended).
     pub fn exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
@@ -47,9 +47,9 @@ fn profile_dir(paths: &Paths, cfg: &Config) -> PathBuf {
     }
 }
 
-/// Spustí dedikovaný Chrome navázaný na virtuální audio a otevře Meet URL.
-/// Mikrofon se auto-povolí (`--use-fake-ui-for-media-stream`); video stroj
-/// nemá, takže kamera je vypnutá sama.
+/// Launches a dedicated Chrome bound to the virtual audio and opens the
+/// Meet URL. Mic access auto-grants (`--use-fake-ui-for-media-stream`); the
+/// machine has no video device, so the camera is off on its own.
 pub fn launch(
     paths: &Paths,
     cfg: &Config,
@@ -80,7 +80,7 @@ pub fn launch(
             "--no-default-browser-check",
             "--disable-session-crashed-bubble",
             "--disable-features=Translate,MediaRouter",
-            "--use-fake-ui-for-media-stream", // auto-grant mikrofonu (reálné virtuální zařízení)
+            "--use-fake-ui-for-media-stream", // auto-grant mic access (real virtual device)
             "--autoplay-policy=no-user-gesture-required",
             "--start-maximized",
         ])
@@ -95,7 +95,7 @@ pub fn launch(
     Ok(Chrome { child, profile })
 }
 
-/// Výsledek pokusu o připojení.
+/// Result of a join attempt.
 pub struct JoinResult {
     pub joined: bool,
     pub note: String,
@@ -109,11 +109,11 @@ struct JoinJson {
     note: String,
 }
 
-/// Vizuálně připojí Jarvise do hovoru: agent screenshotuje, čte, klikne
-/// „Ask to join"/„Join now", vyplní jméno, počká na admit a ověří, že je
-/// v hovoru. Vrací JSON kontrakt {joined, note}.
+/// Visually joins Jarvis to the call: the agent screenshots, reads, clicks
+/// "Ask to join"/"Join now", fills in the name, waits to be admitted, and
+/// verifies it's in the call. Returns the JSON contract {joined, note}.
 pub fn join(paths: &Paths, cfg: &Config) -> Result<JoinResult> {
-    // Chrome potřebuje chvíli na načtení pre-join stránky Meetu
+    // Chrome needs a moment to load the Meet pre-join page
     std::thread::sleep(Duration::from_secs(6));
     let exe = std::env::current_exe().context("nelze zjistit cestu k jarvis binárce")?;
     let exe_s = exe.display().to_string();
@@ -132,18 +132,27 @@ pub fn join(paths: &Paths, cfg: &Config) -> Result<JoinResult> {
 }
 
 fn parse_join(text: &str) -> JoinResult {
-    if let (Some(a), Some(b)) = (text.find('{'), text.rfind('}')) {
-        if a <= b {
-            if let Ok(j) = serde_json::from_str::<JoinJson>(&text[a..=b]) {
-                return JoinResult { joined: j.joined, note: j.note };
-            }
-        }
+    if let Some(j) = extract_last_json(text) {
+        return JoinResult { joined: j.joined, note: j.note };
     }
-    // fallback: bez validního JSON považuj za neúspěch, ale nes s sebou text
+    // fallback: without valid JSON, treat as failure but carry the text along
     JoinResult {
         joined: false,
         note: format!("agent nevrátil validní JSON: {}", text.chars().take(200).collect::<String>()),
     }
+}
+
+/// The JSON contract is the last `{…}` block in the text. The join-agent's
+/// closing prose can contain `{}` (so a naive "first `{` … last `}`" would
+/// break on braces in the prose). We try `{` positions from nearest to the
+/// last `}`; serde rejects invalid spans, so the first real object wins.
+fn extract_last_json(text: &str) -> Option<JoinJson> {
+    let close = text.rfind('}')?;
+    let mut opens: Vec<usize> = text[..=close].match_indices('{').map(|(i, _)| i).collect();
+    opens.reverse();
+    opens
+        .into_iter()
+        .find_map(|open| serde_json::from_str::<JoinJson>(&text[open..=close]).ok())
 }
 
 fn join_prompt(exe: &str, display_name: &str) -> String {

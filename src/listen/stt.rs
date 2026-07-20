@@ -1,5 +1,5 @@
-//! Wrapper nad whisper.cpp (whisper-rs): načtení modelu, přepis jedné
-//! promluvy, filtry proti halucinacím a stahování ggml modelů.
+//! Wrapper around whisper.cpp (whisper-rs): model loading, transcribing a
+//! single utterance, anti-hallucination filters, and ggml model downloads.
 
 use crate::listen::vad::SAMPLE_RATE;
 use crate::util;
@@ -11,13 +11,13 @@ use whisper_rs::{
 };
 
 pub struct Stt {
-    // ctx drží model; state na něj odkazuje přes Arc, ale ctx si necháváme
-    // pro čitelnost vlastnictví
+    // ctx holds the model; state references it via Arc internally, but we
+    // keep ctx around for ownership clarity
     _ctx: WhisperContext,
     state: WhisperState,
     language: Option<String>,
     threads: i32,
-    /// Initial prompt whisperu: slovníková nápověda na vlastní jména.
+    /// Whisper's initial prompt: a dictionary hint for proper names.
     hint: Option<String>,
 }
 
@@ -25,12 +25,12 @@ pub struct Stt {
 pub struct Transcript {
     pub text: String,
     pub lang: String,
-    /// Průměrná pravděpodobnost tokenů 0–1 (hrubá jistota přepisu).
+    /// Average token probability 0-1 (rough transcript confidence).
     pub conf: f32,
 }
 
-/// Fráze, které whisper typicky halucinuje na tichu/hudbě (č. + angl.).
-/// Zahazují se jen krátké a málo jisté přepisy — viz `is_hallucination`.
+/// Phrases whisper typically hallucinates on silence/music (Czech + English).
+/// Only short, low-confidence transcripts get dropped — see `is_hallucination`.
 const HALLUCINATIONS: &[&str] = &[
     "titulky vytvořil",
     "titulky vytvořila",
@@ -43,15 +43,16 @@ const HALLUCINATIONS: &[&str] = &[
 ];
 
 pub fn is_hallucination(text: &str, conf: f32) -> bool {
-    // Práh 0.92: v živém provozu (2026-07-17) whisper halucinoval „Titulky
-    // vytvořil …" na klávesnici/ruchy s conf 0.80–0.87 — jistota u těchto
-    // frází nic neznamená. Krátký text + známá fráze = skoro jistě ruch.
+    // Threshold 0.92: in live use (2026-07-17) whisper hallucinated "Titulky
+    // vytvořil …" ("Subtitles by …") on keyboard noise/room tone with conf
+    // 0.80-0.87 — confidence means nothing for these phrases. Short text +
+    // known phrase = almost certainly noise.
     if text.chars().count() > 80 {
         return false;
     }
     let t = text.to_lowercase();
-    // Samostatné „konec" je klasická česká halucinace na dech/ruch
-    // (živě 6× během dne, conf 0.45–0.78; práh 0.85 s rezervou).
+    // A bare "konec" ("end") is a classic Czech hallucination on breath/noise
+    // (seen live 6x in one day, conf 0.45-0.78; threshold 0.85 with margin).
     if conf < 0.85 && t.trim_matches(|c: char| c.is_ascii_punctuation() || c == ' ') == "konec" {
         return true;
     }
@@ -60,7 +61,7 @@ pub fn is_hallucination(text: &str, conf: f32) -> bool {
 
 impl Stt {
     pub fn load(model_path: &Path, language: &str, threads_cfg: usize, hint: &str) -> Result<Self> {
-        // logy whisper.cpp/ggml → tracing (jinak špiní stderr při každém load)
+        // route whisper.cpp/ggml logs → tracing (otherwise they'd spam stderr on every load)
         static LOG_HOOKS: std::sync::Once = std::sync::Once::new();
         LOG_HOOKS.call_once(whisper_rs::install_logging_hooks);
 
@@ -91,9 +92,9 @@ impl Stt {
         })
     }
 
-    /// Přepíše promluvu (PCM 16 kHz mono). None = nebyla v ní řeč.
+    /// Transcribes an utterance (PCM 16 kHz mono). None = no speech in it.
     pub fn transcribe(&mut self, samples: &[i16]) -> Result<Option<Transcript>> {
-        // whisper si na vstupu < ~1 s stěžuje — doplnit tichem
+        // whisper complains on input < ~1 s — pad with silence
         const MIN_SAMPLES: usize = SAMPLE_RATE + SAMPLE_RATE / 5;
         let mut audio: Vec<f32> = samples.iter().map(|&s| f32::from(s) / 32768.0).collect();
         if audio.len() < MIN_SAMPLES {
@@ -102,21 +103,21 @@ impl Stt {
 
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         p.set_n_threads(self.threads);
-        p.set_language(self.language.as_deref()); // None = autodetekce
+        p.set_language(self.language.as_deref()); // None = autodetect
         p.set_translate(false);
-        p.set_no_context(true); // promluvy jsou nezávislé; brání přenosu halucinací
+        p.set_no_context(true); // utterances are independent; prevents hallucination carryover
         if let Some(h) = &self.hint {
-            p.set_initial_prompt(h); // slovník: vlastní jména („Jarvisi")
+            p.set_initial_prompt(h); // dictionary: proper names ("Jarvisi")
         }
         p.set_suppress_blank(true);
-        p.set_suppress_nst(true); // ne-řečové tokeny (♪ …)
+        p.set_suppress_nst(true); // non-speech tokens (♪ …)
         p.set_print_special(false);
         p.set_print_progress(false);
         p.set_print_realtime(false);
         p.set_print_timestamps(false);
-        // Krátká promluva nepotřebuje plný 30s encoder kontext — hlavní úspora
-        // CPU (stejný trik používá whisper.cpp stream example). Floor 512:
-        // menší kontext způsoboval opakování textu v přepisu.
+        // A short utterance doesn't need the full 30s encoder context — the
+        // main CPU saving (same trick as whisper.cpp's stream example). Floor
+        // 512: a smaller context caused text to repeat in the transcript.
         let secs = audio.len() as f32 / SAMPLE_RATE as f32;
         if secs < 29.0 {
             p.set_audio_ctx(((secs / 30.0 * 1500.0) as i32 + 128).clamp(512, 1500));
@@ -146,7 +147,7 @@ impl Stt {
             } else {
                 0.0
             };
-            // klasická kombinace: segment je nejspíš „přepsané ticho"
+            // classic combo: the segment is most likely "transcribed silence"
             if seg.no_speech_probability() > 0.8 && avg_p < 0.35 {
                 debug!(
                     "segment zahozen (no_speech {:.2}, p {:.2}): {seg_text}",
@@ -178,12 +179,12 @@ impl Stt {
     }
 }
 
-// ---------- stahování modelů ----------
+// ---------- model downloads ----------
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
-/// Stáhne ggml model (např. "large-v3-turbo-q5_0") do `models_dir`.
-/// Atomicky přes .part; existující soubor se nestahuje znovu.
+/// Downloads a ggml model (e.g. "large-v3-turbo-q5_0") into `models_dir`.
+/// Atomic via .part; an existing file is not re-downloaded.
 pub fn download_model(models_dir: &Path, name: &str) -> Result<PathBuf> {
     let target = models_dir.join(format!("ggml-{name}.bin"));
     util::download(&format!("{MODEL_BASE_URL}/ggml-{name}.bin"), &target)?;
@@ -196,21 +197,21 @@ mod tests {
 
     #[test]
     fn hallucination_filter() {
-        // krátké + známá fráze → halucinace i při vysoké confidence
-        // (reálně naměřeno p 0.87 na zvuku klávesnice)
+        // short + known phrase → hallucination even at high confidence
+        // (actually measured p 0.87 on keyboard noise)
         assert!(is_hallucination("Titulky vytvořil DimSum Team", 0.3));
         assert!(is_hallucination("Titulky vytvořil Jirka Kováč", 0.87));
         assert!(is_hallucination("Děkuji za zhlédnutí!", 0.5));
         assert!(is_hallucination("thanks for watching", 0.2));
-        // extrémně jistý přepis se nezahazuje
+        // an extremely confident transcript is not dropped
         assert!(!is_hallucination("Děkuji za zhlédnutí", 0.95));
-        // dlouhý text se nezahazuje (reálná řeč o titulcích)
+        // long text is not dropped (real speech about subtitles)
         let long = "Dneska jsem řešil, jak se generují titulky. Titulky vytvořil \
                     nástroj, který jsme ladili celé odpoledne a výsledek je fajn.";
         assert!(!is_hallucination(long, 0.3));
-        // běžná česká věta
+        // ordinary Czech sentence
         assert!(!is_hallucination("pojď se podívat na ten pull request", 0.4));
-        // samostatné „konec" = halucinace na ruch; jisté nebo ve větě zůstává
+        // bare "konec" = hallucination on noise; kept when confident or in a sentence
         assert!(is_hallucination("Konec.", 0.75));
         assert!(is_hallucination(" konec ", 0.45));
         assert!(!is_hallucination("Konec.", 0.9));

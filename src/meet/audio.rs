@@ -1,25 +1,25 @@
-//! Virtuální PulseAudio zařízení pro `jarvis meet`. Jarvis vystupuje v hovoru
-//! jako samostatný účastník s vlastním mikrofonem a reproduktorem — oboje
-//! virtuální, aby se jeho zvuk nemíchal s hardwarovým mikrofonem uživatele:
+//! Virtual PulseAudio devices for `jarvis meet`. Jarvis joins the call as a
+//! separate participant with its own mic and speaker — both virtual, so its
+//! audio doesn't mix with the user's hardware mic:
 //!
 //! ```text
 //! Jarvis TTS ─paplay─► mic_sink (null) ─.monitor─► remap ► mic_source ─► Chrome getUserMedia (uplink)
 //! Meet downlink ─► Chrome output ─► ear_sink (null) ─.monitor─► parec ► whisper STT
 //! ```
 //!
-//! Chrome se na tato zařízení naváže přes `PULSE_SINK`/`PULSE_SOURCE` env
-//! (ověřeno: samotné env stačí, ruční `move-*` není potřeba).
+//! Chrome binds to these devices via `PULSE_SINK`/`PULSE_SOURCE` env vars
+//! (verified: env alone is enough, no manual `move-*` needed).
 //!
-//! POZOR: `pactl list` (dlouhá forma) je lokalizovaná (české popisky) — proto
-//! všechny dotazy jedou s `LC_ALL=C` a přes `list short` (tab-separated,
-//! ne-lokalizované). Zařízení jsou efemérní: vytvoří se při vstupu do hovoru
-//! a při odchodu (i přes `Drop`) se zase odstraní.
+//! NOTE: `pactl list` (long form) is localized (Czech labels) — so all
+//! queries use `LC_ALL=C` and `list short` (tab-separated, not localized).
+//! Devices are ephemeral: created on call entry and removed on exit (even
+//! via `Drop`).
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-/// Sada virtuálních zařízení držená po dobu hovoru. `Drop` je uklidí.
+/// Set of virtual devices held for the call's duration. `Drop` cleans them up.
 pub struct VirtualAudio {
     mic_sink: String,
     mic_source: String,
@@ -28,20 +28,21 @@ pub struct VirtualAudio {
 }
 
 impl VirtualAudio {
-    /// Vytvoří (idempotentně) dva null-sinky + remap-source. Případné staré
-    /// moduly se stejnými názvy se nejdřív odstraní, pak se po loadu ověří,
-    /// že zařízení reálně existují (self-check — load-module může tiše selhat).
+    /// Idempotently creates two null-sinks + a remap-source. Any stale
+    /// modules with the same names are removed first; after loading,
+    /// verifies the devices actually exist (self-check — load-module can
+    /// fail silently).
     pub fn ensure(mic_sink: &str, mic_source: &str, ear_sink: &str) -> Result<Self> {
         let mut va = Self {
             mic_sink: mic_sink.to_string(),
             mic_source: mic_source.to_string(),
             ear_sink: ear_sink.to_string(),
-            torn_down: true, // dokud se úspěšně nenačte, nemáme co uklízet
+            torn_down: true, // nothing to clean up until load succeeds
         };
-        // 1) úklid případných reziduí (po pádu předchozího běhu)
+        // 1) clean up any leftovers (from a previous crashed run)
         va.unload_all();
 
-        // 2) load: null-sinky nejdřív, remap-source (závisí na mic_sink.monitor) až potom
+        // 2) load: null-sinks first, remap-source (depends on mic_sink.monitor) after
         load_module(&[
             "module-null-sink",
             &format!("sink_name={mic_sink}"),
@@ -63,7 +64,7 @@ impl VirtualAudio {
         .context("nelze vytvořit mic_source (remap-source)")?;
         va.torn_down = false;
 
-        // 3) read-back: zařízení musí reálně existovat
+        // 3) read-back: devices must actually exist
         if !sink_exists(mic_sink)? {
             va.unload_all();
             bail!("mic_sink '{mic_sink}' po load-module neexistuje");
@@ -81,24 +82,24 @@ impl VirtualAudio {
         Ok(va)
     }
 
-    /// PulseAudio source, který poslouchá STT (zvuk hovoru = ostatní účastníci).
+    /// PulseAudio source that STT listens on (call audio = other participants).
     pub fn ear_monitor(&self) -> String {
         format!("{}.monitor", self.ear_sink)
     }
-    /// PulseAudio sink, do kterého se přehrává Jarvisova řeč (→ mikrofon hovoru).
+    /// PulseAudio sink Jarvis's speech is played into (→ the call's mic).
     pub fn mic_sink(&self) -> &str {
         &self.mic_sink
     }
-    /// PulseAudio source, který Chrome vybere jako mikrofon.
+    /// PulseAudio source Chrome picks as its microphone.
     pub fn mic_source(&self) -> &str {
         &self.mic_source
     }
-    /// PulseAudio sink, kam Chrome hraje zvuk hovoru (PULSE_SINK pro Chrome).
+    /// PulseAudio sink Chrome plays call audio into (PULSE_SINK for Chrome).
     pub fn ear_sink(&self) -> &str {
         &self.ear_sink
     }
 
-    /// Odstraní všechna zařízení. Idempotentní — po prvním volání už nic nedělá.
+    /// Removes all devices. Idempotent — a no-op after the first call.
     pub fn teardown(&mut self) {
         if self.torn_down {
             return;
@@ -108,8 +109,8 @@ impl VirtualAudio {
         info!("virtuální audio odstraněno");
     }
 
-    /// Odstraní moduly vlastnící naše zařízení (bez ohledu na `torn_down`).
-    /// Pořadí: nejdřív remap-source (závisí na mic_sink.monitor), pak null-sinky.
+    /// Removes modules owning our devices (regardless of `torn_down`).
+    /// Order: remap-source first (depends on mic_sink.monitor), then null-sinks.
     fn unload_all(&self) {
         for needle in [
             format!("source_name={}", self.mic_source),
@@ -138,7 +139,7 @@ impl Drop for VirtualAudio {
     }
 }
 
-/// Spustí `pactl` s `LC_ALL=C` a vrátí stdout (chyba na nenulový exit).
+/// Runs `pactl` with `LC_ALL=C` and returns stdout (errors on nonzero exit).
 fn pactl(args: &[&str]) -> Result<String> {
     let out = Command::new("pactl")
         .env("LC_ALL", "C")
@@ -166,9 +167,10 @@ fn unload_module(index: u32) -> Result<()> {
     pactl(&["unload-module", &idx]).map(|_| ())
 }
 
-/// Indexy modulů, jejichž argumenty obsahují daný token (např.
-/// `sink_name=jarvis_mic_sink`). Token se porovnává celý, ne jako podřetězec —
-/// jinak by `source_name=jarvis_mic` chytlo i `…=jarvis_mic_sink`.
+/// Indices of modules whose args contain the given token (e.g.
+/// `sink_name=jarvis_mic_sink`). The token is matched as a whole, not as a
+/// substring — otherwise `source_name=jarvis_mic` would also match
+/// `…=jarvis_mic_sink`.
 fn module_indices(needle: &str) -> Result<Vec<u32>> {
     let out = pactl(&["list", "short", "modules"])?;
     Ok(parse_module_indices(&out, needle))
@@ -201,11 +203,11 @@ fn source_exists(name: &str) -> Result<bool> {
     Ok(short_list_has_name(&out, name))
 }
 
-/// `pactl list short {sinks,sources}` → sloupec 1 (index), sloupec 2 (název).
+/// `pactl list short {sinks,sources}` → column 1 (index), column 2 (name).
 fn short_list_has_name(list_short: &str, name: &str) -> bool {
     list_short.lines().any(|line| {
         let mut cols = line.split('\t');
-        cols.next(); // index
+        cols.next(); // index column
         cols.next().map(str::trim) == Some(name)
     })
 }
@@ -223,11 +225,11 @@ mod tests {
 
     #[test]
     fn module_index_matches_exact_token_not_substring() {
-        // sink_name=jarvis_mic_sink smí trefit jen null-sink (řádek 33),
-        // NE remap-source, který má jarvis_mic_sink jen v master=…monitor
+        // sink_name=jarvis_mic_sink must match only the null-sink (line 33),
+        // NOT the remap-source, which has jarvis_mic_sink only in master=…monitor
         assert_eq!(parse_module_indices(MODULES, "sink_name=jarvis_mic_sink"), vec![33]);
         assert_eq!(parse_module_indices(MODULES, "sink_name=jarvis_ear_sink"), vec![34]);
-        // source_name=jarvis_mic (substring jarvis_mic_sink) trefí JEN remap (35)
+        // source_name=jarvis_mic (substring jarvis_mic_sink) matches ONLY remap (35)
         assert_eq!(parse_module_indices(MODULES, "source_name=jarvis_mic"), vec![35]);
     }
 
@@ -245,7 +247,7 @@ mod tests {
         assert!(sink_exists("jarvis_t_mic_sink").unwrap(), "mic_sink má existovat");
         assert!(sink_exists("jarvis_t_ear_sink").unwrap(), "ear_sink má existovat");
         assert!(source_exists("jarvis_t_mic").unwrap(), "mic_source má existovat");
-        // idempotence: druhé ensure nesmí spadnout ani duplikovat
+        // idempotence: a second ensure must not fail or duplicate
         let va2 =
             VirtualAudio::ensure("jarvis_t_mic_sink", "jarvis_t_mic", "jarvis_t_ear_sink").unwrap();
         assert_eq!(module_indices("sink_name=jarvis_t_mic_sink").unwrap().len(), 1);
@@ -263,7 +265,7 @@ mod tests {
         assert!(short_list_has_name(sinks, "jarvis_mic_sink"));
         assert!(short_list_has_name(sinks, "alsa_output.pci"));
         assert!(!short_list_has_name(sinks, "jarvis_ear_sink"));
-        // nesmí matchovat podřetězec názvu
+        // must not match a substring of the name
         assert!(!short_list_has_name(sinks, "jarvis_mic"));
     }
 }

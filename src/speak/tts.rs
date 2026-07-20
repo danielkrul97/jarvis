@@ -1,7 +1,7 @@
-//! ElevenLabs API klient (ureq, sync — jako zbytek projektu). Pokrývá jen
-//! to, co Jarvis potřebuje: syntézu řeči, výpis hlasů v účtu a stav kreditů.
-//! Chybové odpovědi API se překládají na česká hlášení s nápovědou, protože
-//! typický scoped klíč umí jen `text_to_speech` a zbytek vrací 401.
+//! ElevenLabs API client (ureq, sync — like the rest of the project). Covers
+//! only what Jarvis needs: speech synthesis, listing account voices, credit
+//! status. API error responses are translated into Czech messages with hints,
+//! because a typical scoped key only allows `text_to_speech` and everything else returns 401.
 
 use crate::config::SpeakCfg;
 use crate::util;
@@ -11,18 +11,18 @@ use std::io::Read;
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.elevenlabs.io";
-/// TTS odpověď je audio; víc než 100 MB znamená, že se něco pokazilo.
+/// A TTS response is audio; more than 100 MB means something went wrong.
 const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Jen *_v2_5 modely umí vynutit jazyk parametrem `language_code`;
-/// multilingual_v2 ho odmítá (HTTP 400) a jazyk detekuje z textu.
+/// Only *_v2_5 models can force the language via `language_code`;
+/// multilingual_v2 rejects it (HTTP 400) and detects the language from the text.
 pub fn supports_language_code(model_id: &str) -> bool {
     model_id.ends_with("_v2_5")
 }
 
-/// Tělo TTS požadavku podle configu.
+/// TTS request body per config.
 fn payload(cfg: &SpeakCfg, text: &str) -> serde_json::Value {
-    // f32 → f64 tahá binární šum (0.95 → 0.9499999…); API dostane 3 desetinná
+    // f32 → f64 drags in binary noise (0.95 → 0.9499999…); API gets 3 decimals
     let r3 = |x: f32| (f64::from(x) * 1000.0).round() / 1000.0;
     let mut v = json!({
         "text": text,
@@ -41,8 +41,8 @@ fn payload(cfg: &SpeakCfg, text: &str) -> serde_json::Value {
     v
 }
 
-/// Z chybového JSON `{"detail": {"status": …, "message": …}}` vytáhne
-/// (status, message); `detail` bývá občas i holý string.
+/// Extracts (status, message) from the error JSON `{"detail": {"status": …,
+/// "message": …}}`; `detail` is sometimes a bare string instead.
 fn error_detail(body: &str) -> (String, String) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let d = &v["detail"];
@@ -58,7 +58,7 @@ fn error_detail(body: &str) -> (String, String) {
     (status, msg)
 }
 
-/// HTTP chybu API převede na srozumitelnou českou chybu s nápovědou.
+/// Converts an API HTTP error into a readable Czech error message with a hint.
 fn api_error(http: u16, body: &str) -> anyhow::Error {
     let (status, msg) = error_detail(body);
     let hint = match status.as_str() {
@@ -76,8 +76,8 @@ fn api_error(http: u16, body: &str) -> anyhow::Error {
     anyhow!("ElevenLabs HTTP {http}{status_part}: {detail}{hint}")
 }
 
-/// Syntéza řeči: vrací audio bajty (formát dle `cfg.output_format`).
-/// Retry 1× na 429/5xx/transport; 4xx je fatální hned.
+/// Speech synthesis: returns audio bytes (format per `cfg.output_format`).
+/// Retries once on 429/5xx/transport errors; 4xx is fatal immediately.
 pub fn synthesize(api_key: &str, cfg: &SpeakCfg, voice_id: &str, text: &str) -> Result<Vec<u8>> {
     let url = format!(
         "{API_BASE}/v1/text-to-speech/{voice_id}?output_format={}",
@@ -123,6 +123,50 @@ pub fn synthesize(api_key: &str, cfg: &SpeakCfg, voice_id: &str, text: &str) -> 
     Err(anyhow!("ElevenLabs: vyčerpány pokusy, poslední chyba: {last}"))
 }
 
+/// Like `synthesize`, but returns a STREAM of audio bytes from the `/stream`
+/// endpoint — the player plays it as it arrives (speech starts after the
+/// first chunk, not the whole mp3). Retry once on 429/5xx/transport happens
+/// BEFORE consuming the body; 4xx is fatal immediately. Body format is the same as `synthesize`.
+pub fn synthesize_stream(
+    api_key: &str,
+    cfg: &SpeakCfg,
+    voice_id: &str,
+    text: &str,
+) -> Result<Box<dyn Read + Send>> {
+    let url = format!(
+        "{API_BASE}/v1/text-to-speech/{voice_id}/stream?output_format={}",
+        cfg.output_format
+    );
+    let body = payload(cfg, text);
+    let mut last = String::new();
+    for (i, delay_s) in [0u64, 3].iter().enumerate() {
+        if *delay_s > 0 {
+            std::thread::sleep(Duration::from_secs(*delay_s));
+        }
+        match ureq::post(&url)
+            .set("xi-api-key", api_key)
+            .timeout(Duration::from_secs(120))
+            .send_json(body.clone())
+        {
+            Ok(r) => return Ok(Box::new(r.into_reader())),
+            Err(ureq::Error::Status(code, r)) => {
+                let body_text = r.into_string().unwrap_or_default();
+                if code == 429 || code >= 500 {
+                    last = format!("HTTP {code}: {}", util::truncate_chars(body_text.trim(), 200));
+                    tracing::warn!("ElevenLabs stream pokus {}/2: {last}", i + 1);
+                    continue;
+                }
+                return Err(api_error(code, &body_text));
+            }
+            Err(e) => {
+                last = format!("transport: {e}");
+                tracing::warn!("ElevenLabs stream pokus {}/2: {last}", i + 1);
+            }
+        }
+    }
+    Err(anyhow!("ElevenLabs stream: vyčerpány pokusy, poslední chyba: {last}"))
+}
+
 pub struct VoiceInfo {
     pub id: String,
     pub name: String,
@@ -130,8 +174,8 @@ pub struct VoiceInfo {
     pub labels: String,
 }
 
-/// Hlasy dostupné v účtu (`jarvis say --list-voices`). Vyžaduje klíč
-/// s oprávněním `voices_read` — scoped TTS klíč dostane vysvětlující chybu.
+/// Voices available in the account (`jarvis say --list-voices`). Requires a
+/// key with `voices_read` permission — a scoped TTS key gets an explanatory error.
 pub fn list_voices(api_key: &str) -> Result<Vec<VoiceInfo>> {
     let resp = ureq::get(&format!("{API_BASE}/v1/voices"))
         .set("xi-api-key", api_key)
@@ -169,11 +213,11 @@ pub fn list_voices(api_key: &str) -> Result<Vec<VoiceInfo>> {
     Ok(voices)
 }
 
-/// Stav kreditů pro `doctor --live`.
+/// Credit status for `doctor --live`.
 pub enum Credits {
-    /// (spotřebováno, měsíční kvóta)
+    /// (used, monthly quota)
     Known { used: u64, limit: u64 },
-    /// Klíč je platný, ale scoped bez `user_read` — zůstatek nejde přečíst.
+    /// The key is valid but scoped without `user_read` — balance can't be read.
     NoPermission,
 }
 
@@ -209,7 +253,9 @@ mod tests {
 
     #[test]
     fn payload_multilingual_v2_omits_language_code() {
-        let cfg = SpeakCfg::default();
+        // explicitly multilingual_v2 (default is now flash_v2_5) — verifies that
+        // a model without support doesn't force the language (would send HTTP 400)
+        let cfg = SpeakCfg { model_id: "eleven_multilingual_v2".into(), ..SpeakCfg::default() };
         let v = payload(&cfg, "Dobrý den");
         assert_eq!(v["model_id"], "eleven_multilingual_v2");
         assert!(v.get("language_code").is_none());
@@ -218,11 +264,19 @@ mod tests {
     }
 
     #[test]
+    fn payload_default_flash_enforces_czech() {
+        // the new default (flash_v2_5) supports and should force language_code=cs
+        let v = payload(&SpeakCfg::default(), "Dobrý den");
+        assert_eq!(v["model_id"], "eleven_flash_v2_5");
+        assert_eq!(v["language_code"], "cs");
+    }
+
+    #[test]
     fn payload_v2_5_enforces_czech() {
         let cfg = SpeakCfg { model_id: "eleven_flash_v2_5".into(), ..SpeakCfg::default() };
         let v = payload(&cfg, "Dobrý den");
         assert_eq!(v["language_code"], "cs");
-        // "auto" vynucení vypne i u modelů, které ho umí
+        // "auto" disables forcing even for models that support it
         let cfg = SpeakCfg {
             model_id: "eleven_flash_v2_5".into(),
             language: "auto".into(),
@@ -231,7 +285,7 @@ mod tests {
         assert!(payload(&cfg, "x").get("language_code").is_none());
     }
 
-    /// Reálné odpovědi API zachycené 2026-07-17 při zapojování klíče.
+    /// Real API responses captured 2026-07-17 while wiring up the key.
     #[test]
     fn error_detail_real_responses() {
         let quota = r#"{"detail":{"type":"invalid_request","code":"quota_exceeded","message":"This request exceeds your quota of 159644. You have 0 credits remaining, while 6 credits are required for this request.","status":"quota_exceeded","request_id":"9d1e89c6c5a9f0f49e232e0f7766bc8b"}}"#;
@@ -243,12 +297,12 @@ mod tests {
         let (status, _) = error_detail(perms);
         assert_eq!(status, "missing_permissions");
 
-        // detail jako holý string (vrací některé starší endpointy)
+        // detail as a bare string (some older endpoints return this)
         let (status, msg) = error_detail(r#"{"detail":"Not found"}"#);
         assert_eq!(status, "");
         assert_eq!(msg, "Not found");
 
-        // ne-JSON tělo nesmí panikařit
+        // non-JSON body must not panic
         let (status, msg) = error_detail("<html>gateway timeout</html>");
         assert_eq!(status, "");
         assert_eq!(msg, "");

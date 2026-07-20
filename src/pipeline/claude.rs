@@ -16,7 +16,7 @@ pub struct ClaudeOutcome {
 
 pub struct ClaudeRequest<'a> {
     pub prompt: String,
-    /// None/prázdný = výchozí model claude CLI
+    /// None/empty = default claude CLI model
     pub model: Option<&'a str>,
     pub cwd: &'a Path,
     pub allowed_tools: &'a str,
@@ -24,8 +24,8 @@ pub struct ClaudeRequest<'a> {
     pub timeout: Duration,
 }
 
-/// Headless volání `claude -p --output-format json`. Prompt jde přes stdin,
-/// stdout/stderr čtou vlákna (jinak by se proces zablokoval na plné rouře).
+/// Headless call to `claude -p --output-format json`. The prompt goes via stdin,
+/// stdout/stderr are read by threads (otherwise the process would block on a full pipe).
 pub fn run(req: &ClaudeRequest) -> Result<ClaudeOutcome> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
@@ -50,7 +50,7 @@ pub fn run(req: &ClaudeRequest) -> Result<ClaudeOutcome> {
     let prompt = req.prompt.clone();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(prompt.as_bytes());
-        // drop stdin → EOF pro claude
+        // drop stdin → EOF for claude
     });
     let mut stdout = child.stdout.take().context("chybí stdout dítěte")?;
     let out_reader = std::thread::spawn(move || {
@@ -114,13 +114,13 @@ fn parse_outcome(stdout: &str) -> Result<ClaudeOutcome> {
     })
 }
 
-// ---------- rezidentní proces (konverzace) ----------
+// ---------- resident process (conversation) ----------
 
-/// Předehřátý `claude -p --input-format stream-json`: proces žije přes víc
-/// otázek, každá otázka = jeden JSONL řádek na stdin, odpověď = `result`
-/// event na stdout. Ušetří ~2 s CLI startu na výměnu a session drží
-/// konverzační paměť. Empiricky 2026-07-17: 1. otázka 3,0 s vč. spawnu,
-/// 2. otázka 2,2 s (čisté API, haiku).
+/// Pre-warmed `claude -p --input-format stream-json`: the process lives across
+/// multiple questions, each question = one JSONL line on stdin, the answer = a
+/// `result` event on stdout. Saves ~2 s of CLI startup per exchange, and the session
+/// holds conversational memory. Empirically 2026-07-17: 1st question 3.0 s incl.
+/// spawn, 2nd question 2.2 s (pure API, haiku).
 pub struct Warm {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -130,9 +130,9 @@ pub struct Warm {
 }
 
 impl Warm {
-    /// `allowed_tools`/`max_turns` určuje volající (converse: jen Read, nebo
-    /// s [wm] i Bash omezený na `jarvis wm`). max_turns platí per zpráva,
-    /// ne per session (ověřeno).
+    /// `allowed_tools`/`max_turns` are set by the caller (converse: Read only, or
+    /// with [wm] also Bash restricted to `jarvis wm`). max_turns applies per message,
+    /// not per session (verified).
     pub fn spawn(model: &str, cwd: &Path, allowed_tools: &str, max_turns: u32) -> Result<Self> {
         let mut cmd = Command::new("claude");
         cmd.args([
@@ -141,8 +141,8 @@ impl Warm {
             "stream-json",
             "--output-format",
             "stream-json",
-            "--verbose", // stream-json výstup ho vyžaduje
-            "--include-partial-messages", // průběžné text_delta pro streamování řeči
+            "--verbose", // required by stream-json output
+            "--include-partial-messages", // incremental text_delta for speech streaming
             "--allowed-tools",
             allowed_tools,
             "--max-turns",
@@ -160,8 +160,8 @@ impl Warm {
         let stdout = child.stdout.take().context("warm claude bez stdout")?;
         let stderr = child.stderr.take().context("warm claude bez stderr")?;
 
-        // čtečka: parsuje stream eventy, dál posílá jen `result`; EOF ukončí
-        // vlákno a drop tx zavře kanál (ask pak vrací Disconnected)
+        // reader: parses stream events, forwards only `result`; EOF ends
+        // the thread and dropping tx closes the channel (ask then returns Disconnected)
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::BufRead;
@@ -170,12 +170,12 @@ impl Warm {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                 if let Some(msg) = parse_stream_line(&v) {
                     if tx.send(msg).is_err() {
-                        break; // majitel zanikl
+                        break; // owner is gone
                     }
                 }
             }
         });
-        // stderr nutno odsávat, jinak se plná roura zasekne; obsah jen do logu
+        // stderr must be drained, otherwise a full pipe would stall it; content goes to the log only
         std::thread::spawn(move || {
             let mut s = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stderr), &mut s);
@@ -187,20 +187,20 @@ impl Warm {
         Ok(Self { child, stdin, rx, exchanges: 0, last_used: Instant::now() })
     }
 
-    /// Vyčpělý proces se má zahodit a nahradit čerstvým.
+    /// A stale process should be discarded and replaced with a fresh one.
     pub fn stale(&self, max_exchanges: usize, idle_s: u64) -> bool {
         self.exchanges >= max_exchanges || self.last_used.elapsed().as_secs() > idle_s
     }
 
-    /// Položí otázku a čeká na výsledek. Jakákoli chyba = proces zahodit
-    /// (po timeoutu by v kanálu mohl ležet opožděný výsledek staré otázky).
+    /// Asks a question and waits for the result. Any error = discard the process
+    /// (after a timeout, a delayed result from an old question could still be sitting in the channel).
     pub fn ask(&mut self, prompt: &str, timeout: Duration) -> Result<ClaudeOutcome> {
         self.ask_streaming(prompt, timeout, |_| {})
     }
 
-    /// Jako `ask`, ale průběžný text ODPOVĚDI (bez „myšlení") jde po tokenech do
-    /// `on_text` — volající z něj skládá věty pro streamovanou syntézu. Vrací
-    /// finální outcome (náklad/tokeny) z `result` eventu.
+    /// Like `ask`, but incremental ANSWER text (excluding "thinking") streams token by
+    /// token to `on_text` — the caller assembles sentences from it for streamed synthesis.
+    /// Returns the final outcome (cost/tokens) from the `result` event.
     pub fn ask_streaming(
         &mut self,
         prompt: &str,
@@ -210,7 +210,7 @@ impl Warm {
         if let Ok(Some(st)) = self.child.try_wait() {
             bail!("warm proces mezitím skončil ({st})");
         }
-        // zahodit případné opožděné zprávy z minula
+        // discard any stale leftover messages
         while self.rx.try_recv().is_ok() {}
         let msg = serde_json::json!({
             "type": "user",
@@ -222,8 +222,8 @@ impl Warm {
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.flush())
             .context("zápis otázky do warm procesu selhal")?;
-        // delty text_delta streamujeme; `result` výměnu uzavře. Timeout platí
-        // na CELOU odpověď (od otázky po result).
+        // we stream text_delta deltas; `result` closes out the exchange. The timeout applies
+        // to the WHOLE answer (from question to result).
         let deadline = Instant::now() + timeout;
         loop {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -255,7 +255,7 @@ impl Drop for Warm {
     }
 }
 
-/// `result` event stream-json výstupu má stejná pole jako -p json obálka.
+/// The `result` event of stream-json output has the same fields as the -p json envelope.
 fn outcome_from_stream(v: &Value) -> Result<ClaudeOutcome, String> {
     let text = v["result"].as_str().unwrap_or_default().to_string();
     if v["is_error"].as_bool().unwrap_or(false) {
@@ -272,16 +272,16 @@ fn outcome_from_stream(v: &Value) -> Result<ClaudeOutcome, String> {
     })
 }
 
-/// Zpráva z reader vlákna warm procesu: buď kus textu odpovědi (průběžně), nebo
-/// finální výsledek (`result` event s nákladem/tokeny).
+/// A message from the warm process's reader thread: either a chunk of answer
+/// text (incremental), or the final result (`result` event with cost/tokens).
 enum StreamMsg {
     Delta(String),
     Done(Result<ClaudeOutcome, String>),
 }
 
-/// Ze stream-json řádku vytáhne buď `text_delta` (průběžný text ODPOVĚDI — ne
-/// „myšlení", to jede jako `thinking_delta`), nebo finální `result`. Ostatní
-/// eventy (system, tool-use, message-level…) ignoruje.
+/// Extracts from a stream-json line either `text_delta` (incremental ANSWER text — not
+/// "thinking", which comes as `thinking_delta`), or the final `result`. Other
+/// events (system, tool-use, message-level…) are ignored.
 fn parse_stream_line(v: &Value) -> Option<StreamMsg> {
     match v["type"].as_str()? {
         "stream_event" => {
@@ -298,7 +298,7 @@ fn parse_stream_line(v: &Value) -> Option<StreamMsg> {
     }
 }
 
-/// Vytáhne JSON objekt z textu odpovědi (ignoruje ```json ploty a text okolo).
+/// Extracts a JSON object from the answer text (ignores ```json fences and surrounding text).
 pub fn extract_json(text: &str) -> Result<&str> {
     let start = text.find('{').context("v odpovědi není JSON objekt")?;
     let end = text.rfind('}').context("v odpovědi není uzavřený JSON objekt")?;
@@ -308,7 +308,7 @@ pub fn extract_json(text: &str) -> Result<&str> {
     Ok(&text[start..=end])
 }
 
-/// Živý test pro doctor --live; levný model, jedna otočka.
+/// Live test for doctor --live; cheap model, one round trip.
 pub fn ping(model: &str) -> Result<String> {
     let tmp = std::env::temp_dir();
     let outcome = run(&ClaudeRequest {
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn outcome_from_stream_result_event() {
-        // tvar result eventu stream-json výstupu (shodný s -p json obálkou)
+        // shape of the result event in stream-json output (same as the -p json envelope)
         let v: Value = serde_json::from_str(
             r#"{"type":"result","subtype":"success","is_error":false,"result":"Ano, pane.","total_cost_usd":0.045,"usage":{"input_tokens":700,"output_tokens":25}}"#,
         )
@@ -371,19 +371,19 @@ mod tests {
 
     #[test]
     fn parse_stream_line_picks_text_delta_and_result() {
-        // průběžný text odpovědi (přesný tvar zachycený z claude 2026-07-18)
+        // incremental answer text (exact shape captured from claude on 2026-07-18)
         let d: Value = serde_json::from_str(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Nem"}}}"#,
         )
         .unwrap();
         assert!(matches!(parse_stream_line(&d), Some(StreamMsg::Delta(t)) if t == "Nem"));
-        // „myšlení" se do řeči nesmí dostat
+        // "thinking" must not leak into speech
         let think: Value = serde_json::from_str(
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}}"#,
         )
         .unwrap();
         assert!(parse_stream_line(&think).is_none());
-        // start bloku i ostatní eventy = None
+        // block start and other events = None
         let start: Value = serde_json::from_str(
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#,
         )

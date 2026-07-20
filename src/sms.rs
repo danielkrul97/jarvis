@@ -1,12 +1,13 @@
-//! SMS přes Twilio Messages API. Odesílatel je buď Messaging Service
-//! (`MG…` SID — Jarvisův případ, alfanumerický sender v poolu služby),
-//! E.164 číslo, nebo alfanumerický sender přímo. Auth = Basic (account SID
-//! + token ze secrets.env), formát requestu form-urlencoded, JSON odpověď.
+//! SMS via the Twilio Messages API. The sender is either a Messaging
+//! Service (`MG…` SID — Jarvis's case, alphanumeric sender in the
+//! service's pool), an E.164 number, or an alphanumeric sender directly.
+//! Auth = Basic (account SID + token from secrets.env), request format is
+//! form-urlencoded, response is JSON.
 //!
-//! Doručení se ověřuje read-backem: po odeslání se stav zprávy polluje
-//! (queued → sending → sent → delivered), `failed`/`undelivered` je chyba
-//! s Twilio hláškou. Alfanumerický sender je jednosměrný — na SMS nejde
-//! odpovědět.
+//! Delivery is verified via read-back: after sending, message status is
+//! polled (queued → sending → sent → delivered); `failed`/`undelivered` is
+//! an error with the Twilio message. An alphanumeric sender is one-way —
+//! SMS replies aren't possible.
 
 use crate::config::SmsCfg;
 use crate::util;
@@ -22,7 +23,7 @@ enum SendError {
     Fatal(String),
 }
 
-/// Pošle SMS; retry s backoffem na 429/5xx/transport. Vrací message SID.
+/// Sends an SMS; retries with backoff on 429/5xx/transport errors. Returns the message SID.
 pub fn send(cfg: &SmsCfg, account_sid: &str, token: &str, to: &str, body: &str) -> Result<String> {
     if !is_e164(to) {
         bail!("příjemce musí být v E.164 formátu (+420123456789), je „{to}“");
@@ -78,9 +79,10 @@ fn try_send(url: &str, auth: &str, params: &[(&str, &str)]) -> Result<String, Se
                 21211 => " (neplatné číslo příjemce)",
                 21608 => " (trial účet smí posílat jen na ověřená čísla)",
                 21606 | 21659 => " (odesílatel/From není schopný SMS pro tuto destinaci)",
-                // 21612/21703 reálně chodí i při vypnutých SMS Geographic
-                // Permissions pro cílovou zemi (konzole → Messaging →
-                // Settings → Geo permissions) — API to nastavit neumí
+                // 21612/21703 also occur in practice when SMS Geographic
+                // Permissions are disabled for the destination country
+                // (console → Messaging → Settings → Geo permissions) —
+                // the API can't configure this
                 21612 => " (kombinace To/From nejde — zkontroluj Geo permissions pro zemi příjemce)",
                 21703 => " (Messaging Service nemá pro destinaci žádného použitelného odesílatele — pool, nebo Geo permissions)",
                 63038 => " (vyčerpán denní limit zpráv účtu)",
@@ -100,8 +102,9 @@ fn try_send(url: &str, auth: &str, params: &[(&str, &str)]) -> Result<String, Se
     }
 }
 
-/// Syrový dotaz na stav — jen síť/parse, failed/undelivered NEinterpretuje
-/// (to řeší volající). Vrací (status, cena, error_code, error_message).
+/// Raw status query — only network/parse, does NOT interpret
+/// failed/undelivered (the caller handles that). Returns (status, price,
+/// error_code, error_message).
 fn fetch_status(
     account_sid: &str,
     token: &str,
@@ -118,12 +121,12 @@ fn fetch_status(
     let status = v["status"].as_str().unwrap_or("unknown").to_string();
     let code = v["error_code"].as_i64().unwrap_or(0);
     let emsg = v["error_message"].as_str().unwrap_or("bez detailu").to_string();
-    // cena chodí záporná ("-0.0831") a se zpožděním
+    // price comes back negative ("-0.0831") and delayed
     let price = v["price"].as_str().and_then(|p| p.parse::<f64>().ok()).map(f64::abs);
     Ok((status, price, code, emsg))
 }
 
-/// Chyba pro definitivně nedoručenou zprávu (failed/undelivered) s nápovědou.
+/// Error for a definitively undelivered message (failed/undelivered), with a hint.
 fn delivery_error(status: &str, code: i64, emsg: &str) -> anyhow::Error {
     let hint = match code {
         21612 | 21703 => {
@@ -136,8 +139,8 @@ fn delivery_error(status: &str, code: i64, emsg: &str) -> anyhow::Error {
     anyhow!("zpráva {status}: Twilio {code} — {emsg}{hint}")
 }
 
-/// Polluje stav až do `delivered`, nebo do timeoutu (pak vrací poslední
-/// dosažený stav — `sent` je pro alfanumerické sendery běžný konec).
+/// Polls status until `delivered` or timeout (then returns the last status
+/// reached — `sent` is a normal end state for alphanumeric senders).
 /// `failed`/`undelivered` = Err.
 pub fn wait_final(
     account_sid: &str,
@@ -159,9 +162,10 @@ pub fn wait_final(
                     return Ok((status, price));
                 }
             }
-            // přechodná chyba pollingu nesmí shodit UŽ ODESLANOU SMS: loguj
-            // a zkoušej dál do deadlinu, teprve pak vrať poslední známý stav
-            // (nebo chybu, jen pokud jsme stav nikdy nezískali)
+            // a transient polling error must not fail an ALREADY-SENT SMS:
+            // log it and keep retrying until the deadline, only then return
+            // the last known status (or an error, but only if we never got
+            // a status at all)
             Err(e) => {
                 warn!("stav SMS zatím nezjištěn, zkusím znovu: {e:#}");
                 if Instant::now() >= deadline {
@@ -175,7 +179,7 @@ pub fn wait_final(
     }
 }
 
-/// Zůstatek účtu pro `doctor --live`.
+/// Account balance for `doctor --live`.
 pub fn balance(account_sid: &str, token: &str) -> Result<String> {
     let url = format!("{API_BASE}/{account_sid}/Balance.json");
     let v: Value = ureq::get(&url)
@@ -192,7 +196,7 @@ pub fn balance(account_sid: &str, token: &str) -> Result<String> {
     ))
 }
 
-// ---------- čisté helpery (unit-testované) ----------
+// ---------- pure helpers (unit-tested) ----------
 
 fn parse_twilio_error(body: &str) -> (i64, String) {
     serde_json::from_str::<Value>(body)
@@ -205,8 +209,8 @@ fn parse_twilio_error(body: &str) -> (i64, String) {
         .unwrap_or((0, body.to_string()))
 }
 
-/// Parametry formuláře: Messaging Service SID (`MG…`) jde do
-/// MessagingServiceSid, cokoli jiného (E.164, alfanumerický sender) do From.
+/// Form params: a Messaging Service SID (`MG…`) goes into
+/// MessagingServiceSid, anything else (E.164, alphanumeric sender) into From.
 pub(crate) fn form_params<'a>(from: &'a str, to: &'a str, body: &'a str) -> Vec<(&'static str, &'a str)> {
     let sender_key = if is_messaging_sid(from) { "MessagingServiceSid" } else { "From" };
     vec![("To", to), ("Body", body), (sender_key, from)]
@@ -224,7 +228,7 @@ pub(crate) fn is_messaging_sid(s: &str) -> bool {
     s.len() == 34 && s.starts_with("MG") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Alfanumerický sender: 1–11 znaků [A-Za-z0-9 ], aspoň jedno písmeno.
+/// Alphanumeric sender: 1-11 chars [A-Za-z0-9 ], at least one letter.
 pub(crate) fn is_alpha_sender(s: &str) -> bool {
     (1..=11).contains(&s.chars().count())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ')
@@ -235,8 +239,8 @@ fn basic_auth(user: &str, pass: &str) -> String {
     format!("Basic {}", b64(format!("{user}:{pass}").as_bytes()))
 }
 
-/// RFC 4648 base64 (standardní abeceda, s paddingem) — jediné použití
-/// v projektu je Basic auth, závislost by byla zbytečná.
+/// RFC 4648 base64 (standard alphabet, with padding) — the only use in the
+/// project is Basic auth, so a dependency would be overkill.
 pub(crate) fn b64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -273,23 +277,23 @@ mod tests {
     fn e164_validation() {
         assert!(is_e164("+420733606016"));
         assert!(is_e164("+15005550006"));
-        assert!(!is_e164("420733606016")); // chybí +
-        assert!(!is_e164("+0420733606016")); // nula po +
-        assert!(!is_e164("+420 733 606 016")); // mezery
-        assert!(!is_e164("+42")); // moc krátké
-        assert!(!is_e164("+123456789012345678")); // moc dlouhé
+        assert!(!is_e164("420733606016")); // missing +
+        assert!(!is_e164("+0420733606016")); // zero right after +
+        assert!(!is_e164("+420 733 606 016")); // spaces
+        assert!(!is_e164("+42")); // too short
+        assert!(!is_e164("+123456789012345678")); // too long
     }
 
     #[test]
     fn messaging_sid_and_alpha_sender() {
         assert!(is_messaging_sid("MG0123456789abcdef0123456789abcdef"));
-        assert!(!is_messaging_sid("ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")); // AC = Account SID, ne Messaging
-        assert!(!is_messaging_sid("MG3d99")); // krátké
+        assert!(!is_messaging_sid("ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")); // AC = Account SID, not Messaging
+        assert!(!is_messaging_sid("MG3d99")); // short
         assert!(is_alpha_sender("Olvano"));
         assert!(is_alpha_sender("Jarvis 24"));
-        assert!(!is_alpha_sender("123456")); // bez písmene
+        assert!(!is_alpha_sender("123456")); // no letter
         assert!(!is_alpha_sender("MocDlouhySender")); // >11
-        assert!(!is_alpha_sender("no-reply")); // pomlčka
+        assert!(!is_alpha_sender("no-reply")); // hyphen
     }
 
     #[test]
