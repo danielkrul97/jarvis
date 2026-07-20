@@ -8,6 +8,7 @@
 //!   - draft a change on an ISOLATED git branch (never `main`, never the
 //!     running binary) — fully reversible, touches nothing live,
 //!   - run the test suite on that branch (`cargo test` — a check that can fail).
+//!
 //! Merging to `main` requires human approval (TTY typed-token, same gate as
 //! `runbook approve`, or a verified Telegram numeric confirm). The exact diff's
 //! sha256 is pinned at approval and re-verified before the merge (TOCTOU-safe,
@@ -231,7 +232,7 @@ pub fn cli(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, cmd: Improv
                 println!("Ledger je prázdný. Zařaď vylepšení: jarvis improve queue \"…\"");
                 return Ok(());
             }
-            println!("{:>4}  {:<11} {:<40} {}", "id", "stav", "název", "větev");
+            println!("{:>4}  {:<11} {:<40} větev", "id", "stav", "název");
             for r in &rows {
                 println!("{}", fmt_improvement(r));
             }
