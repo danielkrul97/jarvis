@@ -46,6 +46,7 @@ const DRAFT_TOOLS: &str = "Read,Edit,Write,Bash(cargo build:*),Bash(cargo test:*
 pub const SRC_DIRECTED: &str = "directed"; // "Jarvisi, teach yourself X"
 pub const SRC_FAILING_TEST: &str = "failing_test";
 pub const SRC_CLIPPY: &str = "clippy";
+pub const SRC_IDEATED: &str = "ideated"; // Jarvis decided this one itself (ideation)
 pub const SRC_PLAN_ITEM: &str = "plan_item";
 pub const SRC_RUNBOOK_FIX: &str = "runbook_fix";
 
@@ -138,7 +139,7 @@ pub fn title_from_spec(spec: &str) -> String {
 fn is_valid_source(s: &str) -> bool {
     matches!(
         s,
-        SRC_DIRECTED | SRC_FAILING_TEST | SRC_CLIPPY | SRC_PLAN_ITEM | SRC_RUNBOOK_FIX
+        SRC_DIRECTED | SRC_FAILING_TEST | SRC_CLIPPY | SRC_IDEATED | SRC_PLAN_ITEM | SRC_RUNBOOK_FIX
     )
 }
 
@@ -350,11 +351,124 @@ fn notify_proposed(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow) {
 
 // ---------- self-source (opt-in) ----------
 
-/// Opt-in: mine actionable issues from the current main and queue fix tasks.
-/// v1 = clippy warnings on the repo (cheap, clearly scoped). Dedups within the
-/// run and caps how many it queues; returns the count. Only called when the
-/// queue is empty, so warnings don't pile up run over run.
+/// Compact snapshot of Jarvis's runtime state for the ideation prompt: the
+/// north-star from PLAN.md plus what's failing / recurring (runbooks, patterns).
+fn gather_signals(cfg: &Config, conn: &rusqlite::Connection) -> String {
+    let mut s = String::new();
+    if let Ok(plan) = std::fs::read_to_string(repo_root(cfg).join("PLAN.md")) {
+        s.push_str("PLAN.md (výňatek — north-star):\n");
+        s.push_str(&util::truncate_chars(&plan, 1400));
+        s.push('\n');
+    }
+    if let Ok(runs) = crate::runbook::recent_runs(conn, 40) {
+        let failing: Vec<String> = runs
+            .iter()
+            .filter(|r| r.finished_at.is_some() && !r.ok())
+            .map(|r| r.name.clone())
+            .collect();
+        if !failing.is_empty() {
+            s.push_str(&format!("\nOpakovaně padající runbooky: {}\n", failing.join(", ")));
+        }
+    }
+    if let Ok(pats) = crate::patterns::top(conn, 2, 5) {
+        if !pats.is_empty() {
+            s.push_str("\nDetekované rutiny (kandidáti na automatizaci):\n");
+            for p in &pats {
+                s.push_str(&format!("- {} ({}×)\n", util::truncate_chars(&p.description, 80), p.occurrences));
+            }
+        }
+    }
+    if s.is_empty() {
+        s.push_str("(žádné zvláštní provozní signály)\n");
+    }
+    s
+}
+
+/// The ideation prompt: Jarvis reads its own code + state and decides the ONE
+/// highest-leverage, bounded, safe improvement to make to itself.
+fn build_ideation_prompt(signals: &str) -> String {
+    format!(
+        "You are Jarvis, an autonomous assistant that improves its OWN Rust codebase (an \
+X11 watcher + voice assistant). North-star: automate Daniel's work (see PLAN.md). You \
+may Read your own source to understand yourself. Decide the SINGLE highest-leverage \
+improvement to make to yourself right now.\n\n\
+Your current runtime state:\n{signals}\n\n\
+The improvement you pick MUST be:\n\
+- concrete, bounded, and safe — small and self-contained (ideally one or two files),\n\
+- genuinely useful (toward the north-star, or your robustness / quality / coverage),\n\
+- FULLY covered by new unit tests — it will be auto-tested and may be auto-merged and \
+deployed WITHOUT a human first, so it must be low-risk and well tested,\n\
+- NOT a change to gate/safety files (config gate defaults, runbook.rs, improve.rs, \
+units.rs, main.rs, telegram.rs) — those always need human review, so don't pick them.\n\
+Prefer fixing a real weakness you find, hardening an edge case, or a small missing \
+capability. Avoid big speculative features and risky refactors.\n\n\
+Explore the code as needed, then output ONE JSON object and nothing after it:\n\
+{{\"title\": \"short title\", \"spec\": \"precise, self-contained task for a coding \
+agent: what to change, in which file(s), and which unit tests to add\", \"rationale\": \
+\"one line: why this is high-leverage now\"}}"
+    )
+}
+
+/// Autonomous ideation: Jarvis reads its code + state and queues the improvement
+/// it decides on. Returns the new id, or None if it declined / errored.
+fn ideate(cfg: &Config, conn: &rusqlite::Connection) -> Option<i64> {
+    let im = &cfg.improve;
+    let repo = repo_root(cfg);
+    let outcome = match claude::run(&claude::ClaudeRequest {
+        prompt: build_ideation_prompt(&gather_signals(cfg, conn)),
+        model: if im.model.is_empty() { None } else { Some(im.model.as_str()) },
+        cwd: &repo,
+        allowed_tools: "Read",
+        max_turns: 20,
+        timeout: Duration::from_secs(600),
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("improve: ideace selhala: {e:#}");
+            return None;
+        }
+    };
+    let _ = db::insert_cost(conn, util::now_ts(), "improve-ideate", &im.model, outcome.tokens_in, outcome.tokens_out, outcome.cost_usd);
+    let v: serde_json::Value = serde_json::from_str(claude::extract_json(&outcome.text).ok()?).ok()?;
+    let spec_core = v["spec"].as_str().unwrap_or_default().trim();
+    if spec_core.is_empty() {
+        return None;
+    }
+    let rationale = v["rationale"].as_str().unwrap_or_default().trim();
+    let spec = if rationale.is_empty() {
+        spec_core.to_string()
+    } else {
+        format!("{spec_core}\n\n(Proč teď: {rationale})")
+    };
+    let title = match v["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => t.to_string(),
+        None => title_from_spec(&spec),
+    };
+    match db::insert_improvement(conn, util::now_ts(), SRC_IDEATED, &title, &spec) {
+        Ok(id) => {
+            info!("improve: sám jsem se rozhodl vylepšit #{id}: {title}");
+            Some(id)
+        }
+        Err(e) => {
+            warn!("improve: zápis ideovaného úkolu selhal: {e:#}");
+            None
+        }
+    }
+}
+
+/// Self-source (opt-in): when the queue is empty, DECIDE what to improve.
+/// Primary = autonomous ideation (Jarvis reads itself and chooses); fallback =
+/// clippy warnings. Returns how many tasks were queued.
 fn self_source(cfg: &Config, conn: &rusqlite::Connection) -> i64 {
+    if ideate(cfg, conn).is_some() {
+        return 1;
+    }
+    self_source_clippy(cfg, conn)
+}
+
+/// Fallback self-source: queue fix tasks from clippy warnings on main (deduped,
+/// capped). Used only when ideation produced nothing.
+fn self_source_clippy(cfg: &Config, conn: &rusqlite::Connection) -> i64 {
     let repo = repo_root(cfg);
     let out = match run_capture(
         "cargo",
@@ -386,7 +500,7 @@ fn self_source(cfg: &Config, conn: &rusqlite::Connection) -> i64 {
             queued += 1;
         }
         if queued >= 3 {
-            break; // cap per run
+            break;
         }
     }
     queued
@@ -435,8 +549,8 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
             let Ok(Some(p)) = db::improvement_by_id(conn, imp.id) else {
                 return Ok(());
             };
-            if should_auto_merge(im.auto_merge_safe, &p.envelope) {
-                info!("improve tick: #{} je safe třída + auto_merge_safe → merguji bez ptaní", p.id);
+            if should_auto_merge(im.auto_merge_safe, im.auto_merge_code, &p.envelope) {
+                info!("improve tick: #{} (obálka {}) → auto-merge bez ptaní, jen informuju", p.id, p.envelope);
                 let _ = db::set_improvement_approved(conn, p.id, "auto");
                 match merge_improvement(paths, cfg, conn, &p) {
                     Ok(_) => {
@@ -446,8 +560,19 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
                             }
                         }
                         if let Ok(Some(done)) = db::improvement_by_id(conn, p.id) {
-                            let subj = format!("Jarvis: vylepšení #{} — {}", p.id, done.status);
-                            let _ = email_notify(paths, cfg, &subj, &format!("#{} {} → stav {}\n", p.id, p.title, done.status));
+                            let acted = match done.status.as_str() {
+                                STATUS_DEPLOYED => "smergnuto + NASAZENO (rebuild + restart)",
+                                STATUS_MERGED => "smergnuto do main (deploy čeká / vypnut)",
+                                other => other,
+                            };
+                            let subj = format!("Jarvis se sám vylepšil: #{} — {}", p.id, util::truncate_chars(&p.title, 50));
+                            let body = format!(
+                                "Sám jsem se rozhodl a provedl vylepšení VLASTNÍHO kódu — jen tě informuju.\n\n\
+                                 #{}  {}\nzdroj: {}   obálka: {}\nstav: {}\n\n\
+                                 Diff je v gitu (autor Jarvis). Kdyby se nelíbilo: `git -C {} revert <commit>` + přebuild.\n",
+                                p.id, p.title, p.source, p.envelope, acted, repo_root(cfg).display()
+                            );
+                            let _ = email_notify(paths, cfg, &subj, &body);
                         }
                     }
                     Err(e) => {
@@ -456,6 +581,7 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
                     }
                 }
             } else {
+                // gate-critical (or flags off) → human review by e-mail
                 notify_proposed(paths, cfg, &p);
             }
         }
@@ -469,8 +595,8 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
 pub fn run_dry(cfg: &Config, conn: &rusqlite::Connection) -> Result<()> {
     let im = &cfg.improve;
     println!(
-        "Sebe-vývoj: enabled={} | self-source={} | auto-merge-safe={} | deploy={}",
-        im.enabled, im.allow_self_source, im.auto_merge_safe, im.deploy_enabled
+        "Sebe-vývoj: enabled={} | self-source={} | auto-merge: docs={}/kód={} | deploy={}",
+        im.enabled, im.allow_self_source, im.auto_merge_safe, im.auto_merge_code, im.deploy_enabled
     );
     println!(
         "  model={} | max_turns={} | timeout={}s | repair={} | rozpočet={:.2} USD/den | strop={}/den",
@@ -1190,11 +1316,16 @@ fn merge_improvement(
     git_head(&repo, "main")
 }
 
-/// Should `tick` auto-merge this green change without asking? Only the docs-only
-/// safe class, and only when auto_merge_safe is on. Gate-critical and ordinary
-/// code always wait for a human — even under auto_merge_safe.
-pub fn should_auto_merge(auto_merge_safe: bool, envelope: &str) -> bool {
-    auto_merge_safe && envelope == ENV_SAFE
+/// Should `tick` auto-merge this green change without asking? Docs (safe) when
+/// auto_merge_safe; ordinary code (feature) when auto_merge_code; gate-critical
+/// NEVER — a self-editing agent must not rewrite its own gates unreviewed, so
+/// those always wait for a human even with both flags on.
+pub fn should_auto_merge(auto_merge_safe: bool, auto_merge_code: bool, envelope: &str) -> bool {
+    match envelope {
+        ENV_GATE_CRITICAL => false,
+        ENV_SAFE => auto_merge_safe,
+        _ => auto_merge_code,
+    }
 }
 
 /// After a merge: auto-deploy when enabled, otherwise print the manual step.
@@ -1443,11 +1574,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_merge_only_safe_class_and_only_when_enabled() {
-        assert!(should_auto_merge(true, ENV_SAFE));
-        assert!(!should_auto_merge(false, ENV_SAFE), "flag off → never auto-merge");
-        assert!(!should_auto_merge(true, ENV_FEATURE), "ordinary code always needs a human");
-        assert!(!should_auto_merge(true, ENV_GATE_CRITICAL), "gate code never auto-merges");
+    fn auto_merge_policy_matrix() {
+        // docs (safe): governed by auto_merge_safe
+        assert!(should_auto_merge(true, false, ENV_SAFE));
+        assert!(!should_auto_merge(false, false, ENV_SAFE));
+        // ordinary code (feature): governed by auto_merge_code
+        assert!(should_auto_merge(false, true, ENV_FEATURE), "auto_merge_code → code auto-merges");
+        assert!(!should_auto_merge(true, false, ENV_FEATURE), "no code flag → human");
+        // gate-critical: NEVER, even with both flags on
+        assert!(!should_auto_merge(true, true, ENV_GATE_CRITICAL), "gate code never auto-merges");
+    }
+
+    #[test]
+    fn ideation_prompt_constrains_scope() {
+        let p = build_ideation_prompt("Padající runbooky: záloha");
+        assert!(p.contains("Padající runbooky: záloha"), "signals are included");
+        assert!(p.contains("highest-leverage"));
+        assert!(p.contains("gate/safety files"), "steers away from gate code");
+        assert!(p.contains("auto-merged") && p.contains("deployed"), "warns it may auto-land");
+        assert!(p.contains("JSON"));
     }
 
     #[test]

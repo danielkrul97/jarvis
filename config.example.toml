@@ -251,10 +251,12 @@ enabled = false             # SEBE-VÝVOJ: Jarvis píše a testuje změny vlastn
                             # nenasadí nic neschváleného — autonomně jen zapíše na větev a
                             # spustí tam testy; merge do main chce tvůj souhlas (TTY/Telegram),
                             # rebuild živé binárky je další hradlo. false = celá smyčka vypnutá.
-allow_self_source = false   # true = úkoly ber i z vlastních signálů (padající testy, clippy,
-                            # opakovaně padající runbooky); false = jen zadané „nauč se X"
-auto_merge_safe = false     # obálka B: zelenou změnu v bezpečné třídě (jen docs) mergni sám;
-                            # cokoli v kódu — a vždy cokoli u gate/build/závislostí — schvaluješ ty
+allow_self_source = false   # true = Jarvis si SÁM rozhodne co zlepšit (ideace: přečte vlastní
+                            # kód + PLAN + provozní signály); fallback clippy; false = jen zadané „nauč se X"
+auto_merge_safe = false     # obálka B: zelenou docs-only změnu mergni sám (bez ptaní)
+auto_merge_code = false     # obálka B+: mergni sám i zelené KÓDOVÉ změny (jen informuje mailem);
+                            # gate/safety soubory (config gate, runbook.rs, improve.rs, units.rs,
+                            # main.rs, telegram.rs) VŽDY přes tebe — Jarvis nikdy sám nepřepíše vlastní brány
 deploy_enabled = false      # obálka C: po merge se sám přebuild, smoke-test, hot-swap s .prev
                             # rollbackem a restart; false = jen merge, `cargo install` spouštíš ty
 model = ""                  # model pro codegen ("" = nejsilnější default CLI; ne haiku)

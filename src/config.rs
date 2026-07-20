@@ -233,6 +233,12 @@ pub struct ImproveCfg {
     /// (docs-only). Anything touching code — and always anything touching
     /// gate/build/dependency files — still needs your approval regardless.
     pub auto_merge_safe: bool,
+    /// Envelope B+: also auto-merge GREEN ordinary-code changes (feature class),
+    /// informing you after the fact rather than asking. Gate/safety-critical
+    /// files (config gate defaults, runbook.rs, improve.rs, units.rs, main.rs,
+    /// telegram.rs, Cargo.*, .cargo, .github) ALWAYS still need your review — a
+    /// self-editing agent must never rewrite its own gates unreviewed.
+    pub auto_merge_code: bool,
     /// Envelope C: after a merge, rebuild the binary, smoke-test it, hot-swap
     /// with a .prev rollback, and restart the daemons. false = merge only; you
     /// run `cargo install` yourself (today's behaviour).
@@ -271,6 +277,7 @@ impl Default for ImproveCfg {
             enabled: false,
             allow_self_source: false,
             auto_merge_safe: false,
+            auto_merge_code: false,
             deploy_enabled: false,
             model: String::new(),
             max_turns: 40,
