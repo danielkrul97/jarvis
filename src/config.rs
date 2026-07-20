@@ -23,6 +23,7 @@ pub struct Config {
     pub memory: MemoryCfg,
     pub proactive: ProactiveCfg,
     pub tasks: TasksCfg,
+    pub improve: ImproveCfg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +211,78 @@ impl Default for ProactiveCfg {
             // needs classifier + kill-gate → disabled by default
             detect_commitment: false,
             telegram_confirm: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImproveCfg {
+    /// Self-improvement layer: Jarvis writes and tests changes to its OWN
+    /// source on isolated git branches. Safety invariant: it NEVER merges or
+    /// deploys anything unapproved — autonomously it only drafts on a branch
+    /// and runs the tests there; merging to main needs your approval (TTY or
+    /// verified Telegram), and rebuilding the live binary is a further gated
+    /// step. false = the whole loop is off (ship dark).
+    pub enabled: bool,
+    /// Also mine improvement tasks from Jarvis's own signals (failing tests,
+    /// clippy, repeatedly-failing runbooks), not just directed "teach yourself
+    /// X" requests. false = directed tasks only.
+    pub allow_self_source: bool,
+    /// Envelope B: auto-merge a GREEN change when its diff is in the safe class
+    /// (docs-only). Anything touching code — and always anything touching
+    /// gate/build/dependency files — still needs your approval regardless.
+    pub auto_merge_safe: bool,
+    /// Envelope C: after a merge, rebuild the binary, smoke-test it, hot-swap
+    /// with a .prev rollback, and restart the daemons. false = merge only; you
+    /// run `cargo install` yourself (today's behaviour).
+    pub deploy_enabled: bool,
+    /// Codegen model ("" = the strongest default CLI model — self-editing wants
+    /// the best reasoning, unlike the cheap haiku classifiers).
+    pub model: String,
+    /// Max tool-use turns for the codegen edit loop (edit → build → test → fix).
+    pub max_turns: u32,
+    /// Hard timeout (s) for one codegen run.
+    pub timeout_s: u64,
+    /// How many times the agent may retry after red tests before giving up.
+    pub repair_attempts: u32,
+    /// Daily spend guard for the self-improvement loop (its own budget, on top
+    /// of tracking every call in `costs`).
+    pub daily_budget_usd: f64,
+    /// Max improvement attempts started per day (a nagging/runaway guard).
+    pub daily_max: u32,
+    /// Branch name prefix for drafts (`<prefix>/<id>-<slug>`).
+    pub branch_prefix: String,
+    /// git author identity for machine-written commits, so `git log` cleanly
+    /// separates self-authored changes from yours.
+    pub author_name: String,
+    pub author_email: String,
+    /// Remote approval of a proposed change via a verified Telegram chat.
+    pub telegram_approve: bool,
+    /// Source repository path. Empty = the path this binary was built from
+    /// (compile-time manifest dir), which for a self-built Jarvis IS the repo.
+    pub repo_dir: String,
+}
+
+impl Default for ImproveCfg {
+    fn default() -> Self {
+        Self {
+            // ship dark: the entire self-editing loop is off until explicitly enabled
+            enabled: false,
+            allow_self_source: false,
+            auto_merge_safe: false,
+            deploy_enabled: false,
+            model: String::new(),
+            max_turns: 40,
+            timeout_s: 1800,
+            repair_attempts: 2,
+            daily_budget_usd: 5.0,
+            daily_max: 3,
+            branch_prefix: "jarvis/improve".into(),
+            author_name: "Jarvis".into(),
+            author_email: "jarvis@localhost".into(),
+            telegram_approve: false,
+            repo_dir: String::new(),
         }
     }
 }
@@ -469,7 +542,10 @@ pub struct ListenCfg {
     pub pause_when_locked: bool,
     /// STT engine: "auto" = ElevenLabs Scribe (cloud), falls back to local
     /// whisper on error; "elevenlabs" = Scribe only, no fallback; "whisper"
-    /// = local only (free, nothing leaves the machine, but CPU/GPU heavy).
+    /// = local only (free, nothing leaves the machine, but CPU/GPU heavy);
+    /// "realtime" = ElevenLabs scribe_v2_realtime over WebSocket — audio is
+    /// streamed while you speak (transcript ready ~150 ms after you stop),
+    /// falling back to batch Scribe → whisper on error.
     /// In "auto" the whisper model loads lazily on first fallback — as long
     /// as Scribe works, the heavy model never touches the machine.
     pub engine: String,
@@ -928,8 +1004,11 @@ impl Config {
         if !(1.2..=10.0).contains(&l.vad_speech_mult) {
             bail!("listen.vad_speech_mult musí být 1.2–10, je {}", l.vad_speech_mult);
         }
-        if !matches!(l.engine.as_str(), "auto" | "elevenlabs" | "whisper") {
-            bail!("listen.engine musí být auto | elevenlabs | whisper, je '{}'", l.engine);
+        if !matches!(l.engine.as_str(), "auto" | "elevenlabs" | "whisper" | "realtime") {
+            bail!(
+                "listen.engine musí být auto | elevenlabs | whisper | realtime, je '{}'",
+                l.engine
+            );
         }
         if l.scribe_model.is_empty()
             || !l.scribe_model.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
@@ -1189,6 +1268,47 @@ impl Config {
         }
         if !(1..=20).contains(&pr.runbook_fail_streak) {
             bail!("proactive.runbook_fail_streak musí být 1–20, je {}", pr.runbook_fail_streak);
+        }
+        let im = &self.improve;
+        if !(1..=200).contains(&im.max_turns) {
+            bail!("improve.max_turns musí být 1–200, je {}", im.max_turns);
+        }
+        if !(60..=7200).contains(&im.timeout_s) {
+            bail!("improve.timeout_s musí být 60–7200, je {}", im.timeout_s);
+        }
+        if im.repair_attempts > 10 {
+            bail!("improve.repair_attempts musí být 0–10, je {}", im.repair_attempts);
+        }
+        if !(0.0..=100.0).contains(&im.daily_budget_usd) {
+            bail!("improve.daily_budget_usd musí být 0–100, je {}", im.daily_budget_usd);
+        }
+        if im.daily_max > 50 {
+            bail!("improve.daily_max musí být 0–50, je {}", im.daily_max);
+        }
+        if im.branch_prefix.is_empty()
+            || !im
+                .branch_prefix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '/' | '_' | '-'))
+        {
+            bail!(
+                "improve.branch_prefix smí obsahovat jen [a-z0-9/_-] a nesmí být prázdný, je '{}'",
+                im.branch_prefix
+            );
+        }
+        if im.author_name.trim().is_empty() {
+            bail!("improve.author_name nesmí být prázdný");
+        }
+        if !im.author_email.contains('@') {
+            bail!("improve.author_email musí vypadat jako e-mail, je '{}'", im.author_email);
+        }
+        if !im.model.is_empty()
+            && !im.model.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            bail!("improve.model smí obsahovat jen [A-Za-z0-9._-], je '{}'", im.model);
+        }
+        if !im.repo_dir.is_empty() && !std::path::Path::new(&im.repo_dir).is_absolute() {
+            bail!("improve.repo_dir musí být absolutní cesta, je '{}'", im.repo_dir);
         }
         Blacklist::new(&self.capture)?;
         Ok(())

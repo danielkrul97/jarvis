@@ -22,6 +22,9 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# realtime STT (scribe_v2_realtime) přes WebSocket; rustls-tls znovupoužije rustls
+# 0.23, co už táhne ureq — žádný druhý TLS stack ani async runtime
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 ureq = { version = "2", features = ["json"] }
 whisper-rs = { version = "0.16.0", features = ["tracing_backend", "cuda"] }
 x11rb = { version = "0.13", features = ["screensaver", "xtest"] }

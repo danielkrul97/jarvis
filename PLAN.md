@@ -674,3 +674,125 @@ Odhad: M0–M1 ~1 den, M2 ~1 den, M3 ~0,5 dne, M4 ~0,5 dne.
   klíč byl vložen do chatu v plaintextu → **po zprovoznění zrotovat** (stejně
   jako SendGrid, viz §5). Digest ohláška mluví na stroji s audio výstupem
   (obě cesty: systemd timer i `jarvis run`).
+
+---
+
+## 11. Sebe-vývoj (`jarvis improve`) — Jarvis vyvíjí a zlepšuje vlastní kód
+
+North star dotažený na vlastní zdroják: automatizaci (§9 C/D) rozšiřujeme až na
+Jarvisův VLASTNÍ kód. Motor už existuje — `pipeline::claude::run` je headless
+Claude Code (`cwd` + `allowed_tools` jsou parametry; dnes míří na `data_dir`
+s read-only nástroji). Sebe-vývoj = otočit `cwd` na kořen repa, rozšířit
+nástroje o editaci a obalit to STEJNÝMI branami, jaké drží runbooky a nudge.
+Každé vylepšení = **jedna git větev + commit pod strojovou identitou** → auditní
+stopa v gitu, přesně jak má být.
+
+### 11.1 Životní cyklus (state machine)
+
+```
+queued   ── zadání „Jarvisi, nauč se X" / self-source (padající testy, clippy)
+  ▼ draft
+drafting ── větev jarvis/improve/<id>-<slug> z main (NIKDY v main)
+            claude píše kód [cwd=repo, tools=Read,Edit,Write,Bash(cargo:*); git NE]
+            Jarvis commitne pod „Jarvis <jarvis@localhost>" + trailer Jarvis-Improvement:<id>
+  ▼ test   ❱ FAILABLE BRÁNA: cargo build + cargo test na větvi ❰ + test-integrity guard
+tested   ── zeleno; červená / oslabené testy → failed
+  ▼ propose (zapíchne sha256 diffu; klasifikace obálky)
+proposed ── ohlášeno (digest / Telegram / hlas)
+  ▼ approve  ⛔ confirm_at_keyboard (TTY-token) / ověřený Telegram „ano <id>"
+approved ── re-verifikace zapíchnutého sha256 (TOCTOU) + base_commit == HEAD
+  ▼ merge
+merged   ── merge do main s trailerem (kód přistál v gitu)
+  ▼ deploy  ⛔ deploy_enabled; cargo install → smoke (--version/doctor/self-test)
+deployed ──   → swap binárky (.prev záloha) → systemctl restart; smoke FAIL → rolled_back
+```
+
+### 11.2 Bezpečnostní invariant
+
+improve NIKDY sám nemergne ani nenasadí nic neschváleného. Autonomně smí jen
+(a) zapsat změnu na IZOLOVANOU větev (nikdy main, nikdy živá binárka) — plně
+vratné; (b) spustit tam testy. Merge do main = tvůj souhlas (TTY-token stejně
+jako runbook approve, nebo ověřený Telegram s číslem). Diff je zapíchnutý
+sha256 a před mergem se TOCTOU-bezpečně ověří (model `runbook::run_one`).
+Rebuild + restart živé binárky je další, zvlášť hradlovaný krok
+(`deploy_enabled`) se smoke-testem a automatickým rollbackem. Ship dark
+(`enabled=false`).
+
+Dvě strukturální pojistky (zelené testy nestačí — dají se ošidit):
+- **test-integrity** (`improve::test_integrity_ok`): počet `#[test]` na větvi
+  nesmí klesnout — testy se jen přidávají, nikdy neředí kvůli zelené.
+- **gate-critical eskalace** (`improve::classify_envelope` → `gate_critical`):
+  diff sahající na bezpečnostně-kritické soubory (config.rs, runbook.rs,
+  improve.rs, units.rs, main.rs, telegram.rs, kill.rs, Cargo.*,
+  .cargo/config.toml, .github/) jde VŽDY na ruční review, i pod auto-merge.
+
+### 11.3 Obálka autonomie (volba 2026-07-20: cíl C)
+
+- **A** — návrh + testy, merge schvaluješ ty (základ, „nic neschváleného").
+- **B** — + auto-merge bezpečné třídy (jen docs; `auto_merge_safe`).
+- **C** — plná smyčka vč. self-deploy (rebuild+smoke+swap+restart; `deploy_enabled`).
+
+Vše ship-dark; C je cíl, ale každá nebezpečná hrana je za flagem `false`,
+jištěná failable bránami (cargo test → smoke-test → rollback).
+
+### 11.4 Datový model (DB v13)
+
+`improvements(id, created_at, updated_at, source, title, spec, branch,
+base_commit, head_commit, status, envelope, diff_stat, diff_sha256,
+tests_passed, test_output, cost_usd, tokens_in, tokens_out, approved_at,
+approved_via, merged_at, deployed_at, note)`. Git = pravda o KÓDU
+(větev/commit); tabulka = state machine/index nad ním. `diff_sha256` =
+pin-and-verify jako u runbook artefaktů.
+
+### 11.5 CLI (`jarvis improve <sub>`)
+
+| Příkaz | Účel | Fáze |
+|---|---|---|
+| `queue "…" [--source S]` | zařaď zadané vylepšení do ledgeru | ✅ 1 |
+| `list` / `show <id>` / `dismiss <id>` | ledger + detail + zahození | ✅ 1 |
+| `tick --dry-run` | náhled: config + ledger + repo, bez API/zápisu | ✅ 1 |
+| `draft <id> [--dry-run]` | větev + codegen + commit | 2 |
+| `test <id>` | failable brána build+test na větvi | 3 |
+| `propose <id>` / `approve <id>` | zapíchnutí sha256 + TTY/Telegram merge | 4 |
+| `tick` | automatická smyčka (calm, ≤1 akce/tik) | 5 |
+| `deploy <id>` | rebuild + smoke + swap (.prev) + restart | 6 |
+
+Konfigurace `[improve]` (vzor v `config.example.toml`), ship-dark
+`enabled=false`, `deploy_enabled=false`, `allow_self_source=false`,
+`auto_merge_safe=false`.
+
+### 11.6 Stav a plán fází (2026-07-20)
+
+- **Fáze 1 — substrát: HOTOVO a ověřeno.** Config `[improve]` (podle vzoru
+  `ProactiveCfg`, ship dark), migrace DB **v13** + accessory (podle `NudgeRow`),
+  `src/improve.rs` (čistá logika + brány), CLI queue/list/show/dismiss/
+  tick-dry-run, `util::slugify`, `confirm_at_keyboard` povýšeno na `pub(crate)`
+  ke sdílení. Ověření: `cargo test` **269 zelených** (+9 nových); ostrý
+  read-back binárky proti IZOLOVANÉ DB (queue→list→show→dismiss→dry-run,
+  `user_version=13`). Ship dark — nic se nespustí.
+- **Fáze 2 — draft engine:** `git()` helper (vzor `units.rs::systemctl`, git
+  v kódu zatím není nikde), větvení z main, codegen přes `claude::run`
+  (cwd=repo, scoped tools), commit pod strojovou identitou + trailerem.
+  Failable check: git plumbing deterministicky (větev+commit+diff+
+  `git log --author=Jarvis`) + `draft --dry-run` (prompt + args, 0 side
+  effects). **První ostrý (placený) codegen spouštíš ty** — `enabled=false`,
+  stejná logika jako ElevenLabs kvóta / SMS geo-permissions: finální ostré
+  ověření zůstává na tobě.
+- **Fáze 3 — failable brána:** build+test na větvi, test-integrity guard,
+  omezená self-repair (`repair_attempts`). Check: zelená projde, rozbitá
+  zamítne, oslabení testů se chytne.
+- **Fáze 4 — propose→approve→merge:** pin sha256, `confirm_at_keyboard` /
+  Telegram číslo, TOCTOU re-verifikace + `base_commit==HEAD`, merge s trailerem.
+  Check: read-back `git log` merge commitu; tamper → refuse (jako runbook test).
+- **Fáze 5 — reporting + plán:** sekce „Sebe-vývoj" v digestu (u `build.rs:189`),
+  `improve tick` (≤1 akce/tik, jako nudge), volitelný `jarvis-improve.timer`.
+- **Fáze 6 — self-deploy:** `cargo install` → smoke (`--version`/`doctor`/
+  self-test) → swap `~/.cargo/bin/jarvis` (.prev záloha) → `systemctl --user
+  restart` → post-deploy `doctor`; smoke/health FAIL → rollback `.prev`.
+  POZOR: `units.rs` bere `current_exe()` a odmítá `/target/` build → deploy
+  musí instalovat do `~/.cargo/bin` a teprve pak `install-units`.
+  `enabled`/`deploy_enabled` zůstávají `false` do ověření.
+
+Resume: `src/improve.rs` má dočasný `#![allow(dead_code)]` scaffold (odstranit
+po fázi 6, až shell spotřebuje všechny čisté funkce). Další krok: **fáze 2 —
+`git()` helper + `draft`**.

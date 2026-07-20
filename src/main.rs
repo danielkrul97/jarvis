@@ -2,6 +2,7 @@ mod capture;
 mod config;
 mod converse;
 mod digest;
+mod improve;
 mod kill;
 mod listen;
 mod mail;
@@ -231,6 +232,11 @@ enum Cmd {
         /// Instead of evaluating, print a template from the last N real questions (conversations)
         #[arg(long, value_name = "N")]
         from_db: Option<usize>,
+    },
+    /// Self-improvement: Jarvis develops and improves its own code, tracked in git
+    Improve {
+        #[command(subcommand)]
+        cmd: improve::ImproveCmd,
     },
 }
 
@@ -541,6 +547,10 @@ fn main() -> Result<()> {
             } else {
                 anyhow::bail!("zadej JSONL korpus, nebo --from-db N pro šablonu")
             }
+        }
+        Cmd::Improve { cmd } => {
+            let conn = store::db::open(&paths.db_path)?;
+            improve::cli(&paths, &cfg, &conn, cmd)
         }
     }
 }

@@ -776,7 +776,7 @@ pub enum RunbookCmd {
 /// would inherit it), so we additionally require the human to type back the
 /// expected token. Automated paths (timer, voice, stdin=null) can't supply
 /// it and so can't approve execution.
-fn confirm_at_keyboard(prompt: &str, expect: &str) -> Result<()> {
+pub(crate) fn confirm_at_keyboard(prompt: &str, expect: &str) -> Result<()> {
     use std::io::{IsTerminal, Write};
     ensure!(
         std::io::stdin().is_terminal(),

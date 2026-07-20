@@ -6,6 +6,7 @@
 //! `jarvis pause` audio is dropped straight from RAM and VAD resets.
 
 pub mod audio;
+pub mod realtime;
 pub mod scribe;
 pub mod stt;
 pub mod vad;
@@ -282,6 +283,10 @@ pub fn run_listen_ex(
     // frames: 128 × 30 ms ≈ 3.8 s of buffer; utterances: 8 pending transcription
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<i16>>(128);
     let (utt_tx, utt_rx) = mpsc::sync_channel::<Utterance>(8);
+    // realtime STT (engine = "realtime"): the main loop tees non-paused frames
+    // to a worker with its own VAD that streams them to the WebSocket live.
+    let realtime = cfg.listen.engine == "realtime";
+    let (rt_frame_tx, rt_frame_rx) = mpsc::sync_channel::<Vec<i16>>(256);
     let device = cfg.listen.device.clone();
     let device_heal_cmd = cfg.listen.device_heal_cmd.clone();
 
@@ -345,14 +350,30 @@ pub fn run_listen_ex(
         // 1) audio reader: subprocess with restart and backoff
         s.spawn(move || audio_reader_loop(&device, &device_heal_cmd, frame_tx));
 
-        // 2) transcription: whisper runs longer than the realtime frame
-        //    stream → own thread; also owns the conversation hook (dropping tx ends the worker)
+        // 2) transcription off the main loop; owns the conversation hook
+        //    (dropping tx ends the converse worker). Batch: complete utterances
+        //    → transcribe. Realtime: own VAD over the teed frame stream → WS.
         let stt_conn = db::open(&paths.db_path)?;
-        s.spawn(move || {
-            while let Ok(u) = utt_rx.recv() {
-                handle_utterance(&mut engine, &stt_conn, &u, print_only, &source, convo_hook.as_ref());
-            }
-        });
+        if realtime {
+            s.spawn(move || {
+                realtime::run_worker(
+                    paths,
+                    cfg,
+                    rt_frame_rx,
+                    &mut engine,
+                    &stt_conn,
+                    print_only,
+                    &source,
+                    convo_hook.as_ref(),
+                );
+            });
+        } else {
+            s.spawn(move || {
+                while let Ok(u) = utt_rx.recv() {
+                    handle_utterance(&mut engine, &stt_conn, &u, print_only, &source, convo_hook.as_ref());
+                }
+            });
+        }
 
         // 3) conversation worker: Claude and TTS take seconds → off the STT thread
         if let Some((rx, speech_end, control, aec)) = convo_rx {
@@ -456,7 +477,11 @@ pub fn run_listen_ex(
                     }
                 }
             }
-            if let Some(u) = utt {
+            if realtime {
+                // realtime worker runs its own VAD → stream every non-paused
+                // frame (it opens the WS only while it detects speech)
+                let _ = rt_frame_tx.try_send(frame);
+            } else if let Some(u) = utt {
                 if utt_tx.try_send(u).is_err() {
                     warn!(
                         "přepis nestíhá — promluva zahozena (Scribe: pomalá síť; \
@@ -609,67 +634,17 @@ fn handle_utterance(
     let dur = u.samples.len() as f32 / SAMPLE_RATE as f32;
     let t0 = std::time::Instant::now();
     match engine.transcribe(&u.samples) {
-        Ok(Some(t)) => {
-            let rtf = t0.elapsed().as_secs_f32() / dur.max(0.1);
-            info!(
-                "🗣 [{}] ({}, p {:.2}, {:.1} s, rtf {:.2}) {}",
-                util::fmt_hm(u.started_at),
-                t.lang,
-                t.conf,
-                dur,
-                rtf,
-                t.text
-            );
-            if !print_only {
-                if let Err(e) = db::insert_utterance(
-                    conn, u.started_at, u.ended_at, &t.text, &t.lang, f64::from(t.conf), source,
-                ) {
-                    warn!("zápis promluvy selhal: {e:#}");
-                }
-            }
-            if let Some(h) = convo {
-                let speech_end = h.speech_end.load(Ordering::Relaxed);
-                // consume the pending acoustic barge candidate (energy during
-                // speech waiting for transcript confirmation) — always, so it
-                // doesn't stay hanging
-                let bs = h.barge_start.swap(0, Ordering::Relaxed);
-                let barged = h.barge_in && bs != 0 && (bs..=bs + 2).contains(&u.started_at);
-                let triaged =
-                    converse::triage(&h.wake, &h.open_ear, &t.text, u.started_at, speech_end);
-                let is_wake = matches!(triaged, Some(converse::Trigger::Wake));
-                // self-echo: Jarvis's own speech (ack/filler/reply) leaking back
-                // into the mic through imperfect AEC. A wake address can't be an
-                // echo (Jarvis never says its own name) → wake is exempted from
-                // the filter; other self-speech is dropped: barge is NOT
-                // confirmed (Jarvis keeps talking) and no false turn fires
-                // (ends "conversations with itself").
-                if !is_wake && h.control.is_self_echo(&t.text, u.started_at) {
-                    debug!("konverzace: vlastní ozvěna (self-echo) — ignoruji: {}", t.text);
-                } else {
-                    // confirmed acoustic barge (real user) → cut speech now
-                    if barged && h.control.is_speaking() {
-                        h.control.barge_in();
-                        info!("barge-in: uživatel mluví — přerušuji řeč");
-                    }
-                    // a barged utterance is directed even without the name (user cut into speech)
-                    let trigger = if barged { Some(converse::Trigger::Wake) } else { triaged };
-                    if let Some(trigger) = trigger {
-                        // wake barge-in: "Jarvisi …" during speech interrupts (echo-safe even without AEC)
-                        if h.barge_in && trigger == converse::Trigger::Wake && h.control.is_speaking() {
-                            h.control.barge_in();
-                        }
-                        let job = converse::Job {
-                            text: t.text.clone(),
-                            started_at: u.started_at,
-                            trigger,
-                        };
-                        if h.tx.try_send(job).is_err() {
-                            warn!("konverzace: worker nestíhá — promluva zahozena: {}", t.text);
-                        }
-                    }
-                }
-            }
-        }
+        Ok(Some(t)) => deliver_transcript(
+            conn,
+            &t,
+            u.started_at,
+            u.ended_at,
+            dur,
+            t0.elapsed().as_secs_f32(),
+            print_only,
+            source,
+            convo,
+        ),
         Ok(None) => {
             // even a speechless utterance (just noise) consumes a pending barge
             // candidate, so it doesn't linger into the next utterance
@@ -679,6 +654,75 @@ fn handle_utterance(
             debug!("promluva bez řeči ({dur:.1} s) — zahozena");
         }
         Err(e) => warn!("přepis selhal: {e:#}"),
+    }
+}
+
+/// Delivers a ready transcript: log line, DB insert, and the conversation
+/// hand-off (barge confirmation, self-echo filter, triage → worker). Shared by
+/// the batch STT thread (transcribe → here) and the realtime worker (WS commit
+/// → here), so both paths get identical conversation behaviour. `proc_secs` =
+/// processing time for the rtf log (batch transcribe / realtime commit).
+fn deliver_transcript(
+    conn: &rusqlite::Connection,
+    t: &stt::Transcript,
+    started_at: i64,
+    ended_at: i64,
+    audio_dur: f32,
+    proc_secs: f32,
+    print_only: bool,
+    source: &str,
+    convo: Option<&ConvoHook>,
+) {
+    let rtf = proc_secs / audio_dur.max(0.1);
+    info!(
+        "🗣 [{}] ({}, p {:.2}, {:.1} s, rtf {:.2}) {}",
+        util::fmt_hm(started_at),
+        t.lang,
+        t.conf,
+        audio_dur,
+        rtf,
+        t.text
+    );
+    if !print_only {
+        if let Err(e) =
+            db::insert_utterance(conn, started_at, ended_at, &t.text, &t.lang, f64::from(t.conf), source)
+        {
+            warn!("zápis promluvy selhal: {e:#}");
+        }
+    }
+    if let Some(h) = convo {
+        let speech_end = h.speech_end.load(Ordering::Relaxed);
+        // consume the pending acoustic barge candidate (energy during speech
+        // waiting for transcript confirmation) — always, so it doesn't hang
+        let bs = h.barge_start.swap(0, Ordering::Relaxed);
+        let barged = h.barge_in && bs != 0 && (bs..=bs + 2).contains(&started_at);
+        let triaged = converse::triage(&h.wake, &h.open_ear, &t.text, started_at, speech_end);
+        let is_wake = matches!(triaged, Some(converse::Trigger::Wake));
+        // self-echo: Jarvis's own speech (ack/filler/reply) leaking back into the
+        // mic through imperfect AEC. A wake address can't be an echo (Jarvis never
+        // says its own name) → wake is exempted; other self-speech is dropped so
+        // barge isn't confirmed and no false turn fires ("conversations with itself").
+        if !is_wake && h.control.is_self_echo(&t.text, started_at) {
+            debug!("konverzace: vlastní ozvěna (self-echo) — ignoruji: {}", t.text);
+        } else {
+            // confirmed acoustic barge (real user) → cut speech now
+            if barged && h.control.is_speaking() {
+                h.control.barge_in();
+                info!("barge-in: uživatel mluví — přerušuji řeč");
+            }
+            // a barged utterance is directed even without the name (user cut in)
+            let trigger = if barged { Some(converse::Trigger::Wake) } else { triaged };
+            if let Some(trigger) = trigger {
+                // wake barge-in: "Jarvisi …" during speech interrupts (echo-safe even without AEC)
+                if h.barge_in && trigger == converse::Trigger::Wake && h.control.is_speaking() {
+                    h.control.barge_in();
+                }
+                let job = converse::Job { text: t.text.clone(), started_at, trigger };
+                if h.tx.try_send(job).is_err() {
+                    warn!("konverzace: worker nestíhá — promluva zahozena: {}", t.text);
+                }
+            }
+        }
     }
 }
 
@@ -692,6 +736,9 @@ pub fn run_wav(paths: &Paths, cfg: &Config, wav: &Path) -> Result<()> {
         wav.display(),
         samples.len() as f32 / SAMPLE_RATE as f32
     );
+    if cfg.listen.engine == "realtime" {
+        return run_wav_realtime(paths, cfg, &mut engine, &samples);
+    }
     let conn = db::open(&paths.db_path)?;
     let mut v = Vad::new(vad_config(cfg));
     let start = util::now_ts();
@@ -715,6 +762,45 @@ pub fn run_wav(paths: &Paths, cfg: &Config, wav: &Path) -> Result<()> {
     if count == 0 {
         println!("VAD v souboru žádnou řeč nenašel.");
     }
+    Ok(())
+}
+
+/// `jarvis listen --wav` for engine = "realtime": streams the WAV frames to the
+/// realtime worker (own VAD + WebSocket), exactly like the live mic path. A
+/// trailing silence forces the endpoint so the worker commits. `print_only` is
+/// on inside the worker → logs the transcript, writes nothing.
+fn run_wav_realtime(
+    paths: &Paths,
+    cfg: &Config,
+    fallback: &mut Transcriber,
+    samples: &[i16],
+) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(256);
+    std::thread::scope(|s| {
+        // Connection is !Sync → the worker opens its own (print_only skips the
+        // DB write anyway; only the transcript is logged)
+        s.spawn(move || match db::open(&paths.db_path) {
+            Ok(conn) => realtime::run_worker(paths, cfg, rx, fallback, &conn, true, "wav", None),
+            Err(e) => warn!("run_wav realtime: nelze otevřít DB: {e:#}"),
+        });
+        // pace at real time (30 ms/frame) so scribe_v2_realtime sees live-paced
+        // audio like the mic — a burst dump would misrepresent its accuracy
+        let paced = |tx: &mpsc::SyncSender<Vec<i16>>, f: Vec<i16>| {
+            let _ = tx.send(f);
+            std::thread::sleep(Duration::from_millis(vad::FRAME_MS));
+        };
+        for frame in samples.chunks(FRAME_SAMPLES) {
+            if frame.len() == FRAME_SAMPLES {
+                paced(&tx, frame.to_vec());
+            }
+        }
+        // ~1.2 s of trailing silence (> silence_ms) so the VAD endpoints and the
+        // worker commits the utterance
+        for _ in 0..40 {
+            paced(&tx, vec![0i16; FRAME_SAMPLES]);
+        }
+        drop(tx); // worker ends after draining
+    });
     Ok(())
 }
 

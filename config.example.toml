@@ -245,6 +245,30 @@ detect_commitment = false   # závazek v řeči („pošlu…") → připomeň; 
 telegram_confirm = true     # nabídka na Telegram nese akci: „ano N" / „ne N" z ověřeného chatu
                             # ji provede/zahodí (reuse schvalovací smyčky runbooků)
 
+[improve]
+enabled = false             # SEBE-VÝVOJ: Jarvis píše a testuje změny vlastního zdrojáku na
+                            # izolovaných git větvích. Invariant: NIKDY sám nemergne ani
+                            # nenasadí nic neschváleného — autonomně jen zapíše na větev a
+                            # spustí tam testy; merge do main chce tvůj souhlas (TTY/Telegram),
+                            # rebuild živé binárky je další hradlo. false = celá smyčka vypnutá.
+allow_self_source = false   # true = úkoly ber i z vlastních signálů (padající testy, clippy,
+                            # opakovaně padající runbooky); false = jen zadané „nauč se X"
+auto_merge_safe = false     # obálka B: zelenou změnu v bezpečné třídě (jen docs) mergni sám;
+                            # cokoli v kódu — a vždy cokoli u gate/build/závislostí — schvaluješ ty
+deploy_enabled = false      # obálka C: po merge se sám přebuild, smoke-test, hot-swap s .prev
+                            # rollbackem a restart; false = jen merge, `cargo install` spouštíš ty
+model = ""                  # model pro codegen ("" = nejsilnější default CLI; ne haiku)
+max_turns = 40              # kol edit→build→test→oprava ve smyčce agenta
+timeout_s = 1800            # tvrdý timeout jednoho běhu codegenu (s)
+repair_attempts = 2         # kolikrát smí agent zkusit opravit červené testy, než to vzdá
+daily_budget_usd = 5.0      # denní strop útraty smyčky (vlastní rozpočet; vše se loguje do costs)
+daily_max = 3               # max. pokusů o vylepšení za den (pojistka proti utržení ze řetězu)
+branch_prefix = "jarvis/improve"  # větve: <prefix>/<id>-<slug>
+author_name = "Jarvis"      # identita strojových commitů (git log odděluje samo-psané změny)
+author_email = "jarvis@localhost"
+telegram_approve = false    # vzdálené schválení návrhu z ověřeného Telegram chatu
+repo_dir = ""               # cesta k repu; prázdné = adresář, ze kterého byla binárka sestavena
+
 [tasks]
 enabled = true              # plánované interní úlohy: Jarvis si sám řídí housekeeping —
                             # kontrolu vlastních závislostí (binárky, modely, klíče, disk),

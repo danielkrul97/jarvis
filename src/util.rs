@@ -139,6 +139,49 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Folds a single Czech (and common Latin) accented char to its ASCII base;
+/// passes everything else through unchanged. Used by `slugify` and by
+/// confirmation parsers that must match verbs regardless of diacritics.
+pub(crate) fn fold_ascii(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ä' => 'a',
+        'č' | 'ç' => 'c',
+        'ď' => 'd',
+        'é' | 'ě' | 'ê' | 'ë' => 'e',
+        'í' | 'î' | 'ï' => 'i',
+        'ĺ' | 'ľ' => 'l',
+        'ň' => 'n',
+        'ó' | 'ô' | 'ö' | 'ő' => 'o',
+        'ř' => 'r',
+        'š' => 's',
+        'ť' => 't',
+        'ú' | 'ů' | 'û' | 'ü' | 'ű' => 'u',
+        'ý' => 'y',
+        'ž' => 'z',
+        other => other,
+    }
+}
+
+/// git/URL-safe slug: lowercased, Czech diacritics folded to ASCII, runs of
+/// non-alphanumerics collapsed to a single '-', edges trimmed, capped at
+/// `max_chars` characters. Empty when the input has no alphanumerics.
+pub fn slugify(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut prev_dash = true; // suppresses a leading dash
+    for lc in s.chars().flat_map(char::to_lowercase) {
+        let c = fold_ascii(lc);
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let capped: String = out.chars().take(max_chars).collect();
+    capped.trim_matches('-').to_string()
+}
+
 /// SHA-256 (FIPS 180-4). Its only use is hashing a runbook artifact at
 /// approval time (verified before every execution); a dependency would be
 /// overkill — same rationale as the hand-rolled base64 in sms.rs.
@@ -269,5 +312,15 @@ mod tests {
         assert_eq!(human_bytes(500), "500 B");
         assert_eq!(human_bytes(2048), "2.0 KB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn slugify_folds_and_collapses() {
+        assert_eq!(slugify("Přidej RSS čtečku novinek!", 40), "pridej-rss-ctecku-novinek");
+        assert_eq!(slugify("  více   mezer  ", 40), "vice-mezer");
+        assert_eq!(slugify("ŽLUŤOUČKÝ", 40), "zlutoucky");
+        assert_eq!(slugify("!!!", 40), "", "žádné alfanumerické → prázdný slug");
+        // char cap, then edge-dash trim
+        assert_eq!(slugify("aaaa-bbbb-cccc", 6), "aaaa-b");
     }
 }

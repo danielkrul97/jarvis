@@ -372,6 +372,46 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .context("migrace v12 selhala")?;
         conn.pragma_update(None, "user_version", 12)?;
     }
+    if version < 13 {
+        // Self-improvement ledger (`jarvis improve`): Jarvis develops its own
+        // code on isolated git branches and records every attempt here. Git is
+        // the source of truth for the CODE (branch + commit); this table is the
+        // state machine / index over it. status: queued → drafting → tested →
+        // proposed → approved → merged → deployed (or failed | dismissed |
+        // rolled_back). diff_sha256 is pinned at proposal and re-verified
+        // TOCTOU-safe before merge — same integrity model as runbook artifacts.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS improvements(
+               id INTEGER PRIMARY KEY,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               source TEXT NOT NULL DEFAULT 'directed',
+               title TEXT NOT NULL DEFAULT '',
+               spec TEXT NOT NULL DEFAULT '',
+               branch TEXT NOT NULL DEFAULT '',
+               base_commit TEXT NOT NULL DEFAULT '',
+               head_commit TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT 'queued',
+               envelope TEXT NOT NULL DEFAULT '',
+               diff_stat TEXT NOT NULL DEFAULT '',
+               diff_sha256 TEXT NOT NULL DEFAULT '',
+               tests_passed INTEGER,
+               test_output TEXT NOT NULL DEFAULT '',
+               cost_usd REAL NOT NULL DEFAULT 0,
+               tokens_in INTEGER NOT NULL DEFAULT 0,
+               tokens_out INTEGER NOT NULL DEFAULT 0,
+               approved_at INTEGER,
+               approved_via TEXT NOT NULL DEFAULT '',
+               merged_at INTEGER,
+               deployed_at INTEGER,
+               note TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX IF NOT EXISTS idx_improvements_status
+               ON improvements(status, created_at);",
+        )
+        .context("migrace v13 selhala")?;
+        conn.pragma_update(None, "user_version", 13)?;
+    }
     Ok(())
 }
 
@@ -496,6 +536,121 @@ pub fn set_nudge_status(conn: &Connection, id: i64, status: &str, outcome: &str)
     conn.execute(
         "UPDATE nudges SET status=?2, outcome=?3, decided_at=?4 WHERE id=?1",
         params![id, status, outcome, crate::util::now_ts()],
+    )?;
+    Ok(())
+}
+
+// ---------- improvements (self-improvement ledger) ----------
+
+/// One self-improvement attempt. Git holds the actual code (branch/commit);
+/// this row is the state machine over it. Several fields are written by later
+/// lifecycle steps and only read in some phases → allow dead_code like NudgeRow.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ImprovementRow {
+    pub id: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// directed | failing_test | clippy | plan_item | runbook_fix
+    pub source: String,
+    pub title: String,
+    pub spec: String,
+    pub branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    /// queued | drafting | tested | proposed | approved | merged | deployed | failed | dismissed | rolled_back
+    pub status: String,
+    /// safe | feature | gate_critical
+    pub envelope: String,
+    pub diff_stat: String,
+    pub diff_sha256: String,
+    /// None = not run yet, Some(true/false) = green/red
+    pub tests_passed: Option<bool>,
+    pub test_output: String,
+    pub cost_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub approved_at: Option<i64>,
+    pub approved_via: String,
+    pub merged_at: Option<i64>,
+    pub deployed_at: Option<i64>,
+    pub note: String,
+}
+
+const IMPR_COLS: &str = "id, created_at, updated_at, source, title, spec, branch, \
+    base_commit, head_commit, status, envelope, diff_stat, diff_sha256, tests_passed, \
+    test_output, cost_usd, tokens_in, tokens_out, approved_at, approved_via, merged_at, \
+    deployed_at, note";
+
+fn improvement_from_row(r: &rusqlite::Row) -> rusqlite::Result<ImprovementRow> {
+    Ok(ImprovementRow {
+        id: r.get(0)?,
+        created_at: r.get(1)?,
+        updated_at: r.get(2)?,
+        source: r.get(3)?,
+        title: r.get(4)?,
+        spec: r.get(5)?,
+        branch: r.get(6)?,
+        base_commit: r.get(7)?,
+        head_commit: r.get(8)?,
+        status: r.get(9)?,
+        envelope: r.get(10)?,
+        diff_stat: r.get(11)?,
+        diff_sha256: r.get(12)?,
+        tests_passed: r.get::<_, Option<i64>>(13)?.map(|v| v != 0),
+        test_output: r.get(14)?,
+        cost_usd: r.get(15)?,
+        tokens_in: r.get(16)?,
+        tokens_out: r.get(17)?,
+        approved_at: r.get(18)?,
+        approved_via: r.get(19)?,
+        merged_at: r.get(20)?,
+        deployed_at: r.get(21)?,
+        note: r.get(22)?,
+    })
+}
+
+/// Inserts a queued improvement; returns its id.
+pub fn insert_improvement(
+    conn: &Connection,
+    now: i64,
+    source: &str,
+    title: &str,
+    spec: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO improvements(created_at, updated_at, source, title, spec, status)
+         VALUES(?1, ?1, ?2, ?3, ?4, 'queued')",
+        params![now, source, title, spec],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn improvement_by_id(conn: &Connection, id: i64) -> Result<Option<ImprovementRow>> {
+    conn.query_row(
+        &format!("SELECT {IMPR_COLS} FROM improvements WHERE id=?1"),
+        params![id],
+        improvement_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Recent improvements, newest first.
+pub fn improvements_recent(conn: &Connection, limit: usize) -> Result<Vec<ImprovementRow>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {IMPR_COLS} FROM improvements ORDER BY id DESC LIMIT ?1"))?;
+    let rows = stmt
+        .query_map(params![limit as i64], improvement_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Updates status + note, bumping updated_at.
+pub fn set_improvement_status(conn: &Connection, id: i64, status: &str, note: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE improvements SET status=?2, note=?3, updated_at=?4 WHERE id=?1",
+        params![id, status, note, crate::util::now_ts()],
     )?;
     Ok(())
 }
@@ -1208,7 +1363,7 @@ mod tests {
         let conn = test_conn();
         migrate(&conn).unwrap(); // a second call must not fail
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
     }
 
     #[test]
