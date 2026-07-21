@@ -549,8 +549,10 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
             let Ok(Some(p)) = db::improvement_by_id(conn, imp.id) else {
                 return Ok(());
             };
-            if should_auto_merge(im.auto_merge_safe, im.auto_merge_code, &p.envelope) {
-                info!("improve tick: #{} (obálka {}) → auto-merge bez ptaní, jen informuju", p.id, p.envelope);
+            let (nf, nl) = parse_diff_size(&p.diff_stat);
+            let small = is_small_enough(nf, nl, im.auto_merge_max_files, im.auto_merge_max_lines);
+            if should_auto_merge(im.auto_merge_safe, im.auto_merge_code, &p.envelope) && small {
+                info!("improve tick: #{} (obálka {}, {nf} souborů/{nl} řádků) → auto-merge, jen informuju", p.id, p.envelope);
                 let _ = db::set_improvement_approved(conn, p.id, "auto");
                 match merge_improvement(paths, cfg, conn, &p) {
                     Ok(_) => {
@@ -581,7 +583,10 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
                     }
                 }
             } else {
-                // gate-critical (or flags off) → human review by e-mail
+                if should_auto_merge(im.auto_merge_safe, im.auto_merge_code, &p.envelope) && !small {
+                    info!("improve tick: #{} je velká ({nf} souborů / {nl} řádků > strop {}/{}) → k tvému schválení", p.id, im.auto_merge_max_files, im.auto_merge_max_lines);
+                }
+                // gate-critical, too big, or flags off → human review by e-mail
                 notify_proposed(paths, cfg, &p);
             }
         }
@@ -990,6 +995,138 @@ fn run_gate(worktree: &Path, repo: &Path, im: &ImproveCfg) -> Result<GateOutcome
 /// `jarvis improve draft [id] [--dry-run]`: branch off committed main, run
 /// codegen in an isolated worktree, commit under the machine identity, then run
 /// the integrity + build/test gate. Ship-dark: the live path needs `enabled`.
+// ---------- staged (plan-then-build) mode ----------
+
+#[derive(Debug, Clone)]
+struct PlanStep {
+    title: String,
+    spec: String,
+}
+
+/// Planner prompt: decompose a task into the fewest ordered, independently-built
+/// steps (one step if it's already small).
+fn build_plan_prompt(spec: &str, max_steps: usize) -> String {
+    format!(
+        "You are Jarvis planning a change to your OWN Rust codebase (an X11 watcher + \
+voice assistant). Decompose the TASK into the FEWEST ordered steps — each a small, \
+self-contained, testable unit that leaves the code COMPILING. If the task is already \
+small, return exactly ONE step. Use AT MOST {max_steps} steps. You may Read the code \
+to plan well.\n\n\
+TASK: {spec}\n\n\
+Output ONE JSON object and nothing after it:\n\
+{{\"steps\": [{{\"title\": \"short step title\", \"spec\": \"precise instructions for \
+this step: what to change, in which file(s), and which unit tests to add\"}}]}}"
+    )
+}
+
+/// Per-step build prompt for staged mode (earlier steps are already applied).
+fn build_step_prompt(overall_title: &str, i: usize, total: usize, step: &PlanStep) -> String {
+    format!(
+        "You are Jarvis implementing your OWN Rust codebase — STEP {i} OF {total} of a \
+larger change. Overall goal: \"{overall_title}\". Earlier steps are ALREADY applied in \
+the working tree; do ONLY this step.\n\n\
+STEP {i}/{total} — {}:\n{}\n\n\
+House rules: English comments (brief — WHY, not what); match the surrounding style; add \
+unit tests for what you add; NEVER weaken, delete, or #[ignore] existing tests (the test \
+count must not drop); reuse existing helpers; do not add crates unless essential; you \
+have Read/Edit/Write and cargo (build/test) but NOT git. Leave the code COMPILING at the \
+end of this step. When done, output ONE JSON object: {{\"summary\": \"what this step did\"}}",
+        step.title, step.spec
+    )
+}
+
+/// Parses the planner's JSON into ordered steps (capped). Empty/garbage → None.
+fn parse_plan(text: &str, max_steps: usize) -> Option<Vec<PlanStep>> {
+    let v: serde_json::Value = serde_json::from_str(claude::extract_json(text).ok()?).ok()?;
+    let steps: Vec<PlanStep> = v["steps"]
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            let spec = s["spec"].as_str().unwrap_or_default().trim();
+            if spec.is_empty() {
+                return None;
+            }
+            let title = match s["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => t.to_string(),
+                None => title_from_spec(spec),
+            };
+            Some(PlanStep { title, spec: spec.to_string() })
+        })
+        .take(max_steps)
+        .collect();
+    (!steps.is_empty()).then_some(steps)
+}
+
+/// Plans the task into steps. A single-step plan (or any failure) = one ordinary
+/// draft over the whole spec. Costs one planner call for multi-step tasks.
+fn plan_task(
+    cfg: &Config,
+    conn: &rusqlite::Connection,
+    imp: &db::ImprovementRow,
+    total_cost: &mut f64,
+) -> Vec<PlanStep> {
+    let im = &cfg.improve;
+    let single = vec![PlanStep { title: util::truncate_chars(&imp.title, 60), spec: imp.spec.clone() }];
+    if im.plan_max_steps <= 1 {
+        return single;
+    }
+    let outcome = match claude::run(&claude::ClaudeRequest {
+        prompt: build_plan_prompt(&imp.spec, im.plan_max_steps),
+        model: if im.model.is_empty() { None } else { Some(im.model.as_str()) },
+        cwd: &repo_root(cfg),
+        allowed_tools: "Read",
+        max_turns: 12,
+        timeout: Duration::from_secs(600),
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("improve: plán selhal ({e:#}) — dělám jedním draftem");
+            return single;
+        }
+    };
+    *total_cost += outcome.cost_usd;
+    let _ = db::insert_cost(conn, util::now_ts(), "improve-plan", &im.model, outcome.tokens_in, outcome.tokens_out, outcome.cost_usd);
+    parse_plan(&outcome.text, im.plan_max_steps).unwrap_or(single)
+}
+
+fn notify_staged_start(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow, steps: &[PlanStep]) {
+    let mut plan = String::new();
+    for (i, s) in steps.iter().enumerate() {
+        plan.push_str(&format!("  {}. {}\n", i + 1, util::truncate_chars(&s.title, 80)));
+    }
+    let subj = format!("Jarvis začal velký úkol #{} — {} kroků", imp.id, steps.len());
+    let body = format!(
+        "Rozhodl jsem se na větším vylepšení a rozložil ho na {} kroků. Budu tě informovat průběžně.\n\n\
+         #{}  {}\nzdroj: {}\n\nPlán:\n{}",
+        steps.len(),
+        imp.id,
+        imp.title,
+        imp.source,
+        plan
+    );
+    let _ = email_notify(paths, cfg, &subj, &body);
+}
+
+fn notify_staged_step(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow, i: usize, total: usize, step: &PlanStep) {
+    let subj = format!("Jarvis #{}: krok {}/{} — {}", imp.id, i, total, util::truncate_chars(&step.title, 50));
+    let body = format!("Velký úkol #{} „{}“:\nkrok {}/{}: {}\n", imp.id, imp.title, i, total, step.title);
+    let _ = email_notify(paths, cfg, &subj, &body);
+}
+
+fn notify_staged_failed(paths: &Paths, cfg: &Config, imp: &db::ImprovementRow, i: usize, total: usize, reason: &str) {
+    let subj = format!("Jarvis: velký úkol #{} SELHAL (krok {}/{})", imp.id, i, total);
+    let body = format!(
+        "#{}  {}\nselhalo u kroku {}/{}: {}\n\nVětev zůstává k inspekci: jarvis improve show {}\n",
+        imp.id,
+        imp.title,
+        i,
+        total,
+        util::truncate_chars(reason, 500),
+        imp.id
+    );
+    let _ = email_notify(paths, cfg, &subj, &body);
+}
+
 fn draft(
     paths: &Paths,
     cfg: &Config,
@@ -1006,7 +1143,6 @@ fn draft(
     let repo = repo_root(cfg);
     let branch = branch_name(&im.branch_prefix, imp.id, &imp.title);
     let wt = worktree_path(paths, imp.id);
-    let prompt = build_draft_prompt(&imp.spec, &imp.title);
 
     if dry_run {
         println!("── improve draft #{} (dry-run — nic se nespustí) ──", imp.id);
@@ -1016,8 +1152,9 @@ fn draft(
         println!("worktree:  {}", wt.display());
         println!("model:     {}", if im.model.is_empty() { "<default CLI>" } else { &im.model });
         println!("nástroje:  {DRAFT_TOOLS}");
-        println!("max_turns: {} | timeout: {}s | enabled: {}", im.max_turns, im.timeout_s, im.enabled);
-        println!("\n── prompt pro codegen ──\n{prompt}");
+        println!("max_turns: {} | timeout: {}s | plan_max_steps: {} | enabled: {}", im.max_turns, im.timeout_s, im.plan_max_steps, im.enabled);
+        println!("(úkol se nejdřív naplánuje: 1 krok = běžný draft, víc = staged build)");
+        println!("\n── prompt (base draft) ──\n{}", build_draft_prompt(&imp.spec, &imp.title));
         return Ok(());
     }
 
@@ -1057,27 +1194,36 @@ fn draft(
     std::env::set_var("CARGO_TARGET_DIR", repo.join("target"));
 
     let model = if im.model.is_empty() { None } else { Some(im.model.as_str()) };
-    let max_attempts = 1 + im.repair_attempts; // initial draft + up to N repairs
     let mut total_cost = 0.0;
     let mut summary = String::new();
-    let mut last_gate: Option<GateOutcome> = None;
-    let mut head_short = String::new();
-    let mut envelope = ENV_FEATURE;
-    let mut diff_stat = String::new();
-    let mut head_tests = base_tests;
 
-    for attempt in 0..max_attempts {
-        // repairs cost money too — stop before spending past the daily budget
-        if attempt > 0 {
-            let spent = improve_spent_today(conn);
-            if spent >= im.daily_budget_usd {
-                info!("improve #{}: rozpočet vyčerpán ({spent:.2}/{:.2} USD) — už neopravuji", imp.id, im.daily_budget_usd);
-                break;
-            }
+    // 1) PLAN the task into steps (1 = ordinary draft, >1 = staged build)
+    let steps = plan_task(cfg, conn, &imp, &mut total_cost);
+    let staged = steps.len() > 1;
+    info!(
+        "improve #{}: {} — {} krok(ů), base {base_tests} testů",
+        imp.id,
+        if staged { "STAGED" } else { "draft" },
+        steps.len()
+    );
+    if staged {
+        notify_staged_start(paths, cfg, &imp, &steps);
+    }
+
+    // 2) BUILD each step, accumulating in the worktree with a checkpoint commit
+    for (i, step) in steps.iter().enumerate() {
+        if improve_spent_today(conn) >= im.daily_budget_usd {
+            warn!("improve #{}: rozpočet vyčerpán u kroku {}/{} — stavím jen co mám", imp.id, i + 1, steps.len());
+            break;
         }
-        let prompt = match &last_gate {
-            None => build_draft_prompt(&imp.spec, &imp.title),
-            Some(g) => build_repair_prompt(&imp.spec, &g.output),
+        if staged {
+            info!("improve #{}: krok {}/{}: {}", imp.id, i + 1, steps.len(), step.title);
+            notify_staged_step(paths, cfg, &imp, i + 1, steps.len(), step);
+        }
+        let prompt = if staged {
+            build_step_prompt(&imp.title, i + 1, steps.len(), step)
+        } else {
+            build_draft_prompt(&imp.spec, &imp.title)
         };
         let outcome = match claude::run(&claude::ClaudeRequest {
             prompt,
@@ -1090,67 +1236,67 @@ fn draft(
             Ok(o) => o,
             Err(e) => {
                 db::update_improvement_tests(conn, imp.id, None, &util::truncate_chars(&format!("{e:#}"), 2000), STATUS_FAILED)?;
-                if attempt == 0 {
+                if i == 0 && worktree_is_clean(&wt).unwrap_or(true) {
                     cleanup_worktree(&repo, &wt); // nothing worth keeping
+                }
+                if staged {
+                    notify_staged_failed(paths, cfg, &imp, i + 1, steps.len(), &format!("codegen: {e:#}"));
                 }
                 return Err(e).context("codegen selhal");
             }
         };
         total_cost += outcome.cost_usd;
         db::add_improvement_cost(conn, imp.id, outcome.cost_usd, outcome.tokens_in, outcome.tokens_out)?;
-        let _ = db::insert_cost(
-            conn,
-            util::now_ts(),
-            if attempt == 0 { "improve" } else { "improve-repair" },
-            &im.model,
-            outcome.tokens_in,
-            outcome.tokens_out,
-            outcome.cost_usd,
-        );
-        let result = parse_draft_result(&outcome.text);
-        if let Some(r) = &result {
+        let _ = db::insert_cost(conn, util::now_ts(), if staged { "improve-step" } else { "improve" }, &im.model, outcome.tokens_in, outcome.tokens_out, outcome.cost_usd);
+        if let Some(r) = parse_draft_result(&outcome.text) {
             if !r.summary.is_empty() {
-                summary = r.summary.clone();
+                summary = r.summary;
             }
         }
-
-        if worktree_is_clean(&wt)? {
-            if attempt == 0 {
-                db::update_improvement_tests(conn, imp.id, None, "agent neprovedl žádnou změnu", STATUS_FAILED)?;
-                cleanup_worktree(&repo, &wt);
-                bail!("codegen neprovedl žádnou změnu (#{} → failed)", imp.id);
-            }
-            info!("improve #{}: oprava nic nezměnila — končím s poslední červenou", imp.id);
-            break;
+        // checkpoint this step (earlier steps stay committed even if a later one fails)
+        if !worktree_is_clean(&wt)? {
+            let msg = if staged {
+                format!("{}: krok {}/{} — {}\n\nJarvis-Improvement: {}\n", util::truncate_chars(&imp.title, 60), i + 1, steps.len(), step.title, imp.id)
+            } else {
+                draft_commit_message(imp.id, &imp.title, None)
+            };
+            commit_all(&wt, im, &msg)?;
         }
+    }
 
-        let head = commit_all(&wt, im, &draft_commit_message(imp.id, &imp.title, result.as_ref()))?;
-        head_short = short(&head).to_string();
-        let files = changed_files(&wt, &base)?;
-        envelope = classify_envelope(&files);
-        diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
-        db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
-        info!("improve #{}: commit {head_short} ({} souborů, obálka {envelope}, pokus {})", imp.id, files.len(), attempt + 1);
-
-        // integrity guard: the suite must not shrink
-        head_tests = count_test_attrs(&wt);
-        if !test_integrity_ok(base_tests, head_tests) {
-            let note = format!("test-integrity FAIL: base {base_tests} → head {head_tests} (testy nesmí ubývat)");
-            db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
-            bail!("#{}: {note} — zamítnuto (větev {branch} zůstává k inspekci)", imp.id);
+    // 3) did anything actually change? then record metadata + integrity-guard
+    let files = changed_files(&wt, &base)?;
+    if files.is_empty() {
+        db::update_improvement_tests(conn, imp.id, None, "agent neprovedl žádnou změnu", STATUS_FAILED)?;
+        cleanup_worktree(&repo, &wt);
+        bail!("codegen neprovedl žádnou změnu (#{} → failed)", imp.id);
+    }
+    let mut head = git_head(&wt, "HEAD")?;
+    let mut envelope = classify_envelope(&files);
+    let mut diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
+    db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
+    let mut head_tests = count_test_attrs(&wt);
+    if !test_integrity_ok(base_tests, head_tests) {
+        let note = format!("test-integrity FAIL: base {base_tests} → head {head_tests} (testy nesmí ubývat)");
+        db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
+        if staged {
+            notify_staged_failed(paths, cfg, &imp, steps.len(), steps.len(), &note);
         }
+        bail!("#{}: {note} — zamítnuto (větev {branch} zůstává k inspekci)", imp.id);
+    }
 
-        // failable gate: build + test
+    // 4) authoritative gate on the WHOLE change + bounded self-repair
+    let max_gate_attempts = 1 + im.repair_attempts;
+    for attempt in 0..max_gate_attempts {
         let gate = run_gate(&wt, &repo, im)?;
         if gate.passed {
             db::update_improvement_tests(conn, imp.id, Some(true), &gate.output, STATUS_TESTED)?;
             println!("── improve draft #{} ──", imp.id);
             println!("větev:   {branch}");
-            println!("commit:  {head_short}");
+            println!("commit:  {}", short(&head));
             println!("obálka:  {envelope}");
             println!("diff:    {diff_stat}");
-            let repaired = if attempt > 0 { format!(" (po {} opravě/ách)", attempt) } else { String::new() };
-            println!("testy:   base {base_tests} → head {head_tests}; brána ✓ ZELENÁ{repaired}");
+            println!("kroky:   {} | testy: base {base_tests} → head {head_tests}; brána ✓ ZELENÁ", steps.len());
             if !summary.is_empty() {
                 println!("shrnutí: {}", util::truncate_chars(&summary, 200));
             }
@@ -1159,22 +1305,53 @@ fn draft(
             return Ok(());
         }
         db::update_improvement_tests(conn, imp.id, Some(false), &gate.output, STATUS_FAILED)?;
-        last_gate = Some(gate);
-        if attempt + 1 < max_attempts {
-            info!("improve #{}: brána ČERVENÁ — pokus o opravu ({}/{})", imp.id, attempt + 1, im.repair_attempts);
+        if attempt + 1 >= max_gate_attempts || improve_spent_today(conn) >= im.daily_budget_usd {
+            let reason = format!("brána červená ({} pokus/ů; limit oprav nebo rozpočtu)", attempt + 1);
+            println!("── improve draft #{} ── ✗ {reason}. Log: jarvis improve show {}", imp.id, imp.id);
+            if staged {
+                notify_staged_failed(paths, cfg, &imp, steps.len(), steps.len(), &reason);
+            }
+            bail!("{reason} (#{} → failed)", imp.id);
+        }
+        info!("improve #{}: brána ČERVENÁ — oprava {}/{}", imp.id, attempt + 1, im.repair_attempts);
+        let outcome = match claude::run(&claude::ClaudeRequest {
+            prompt: build_repair_prompt(&imp.spec, &gate.output),
+            model,
+            cwd: &wt,
+            allowed_tools: DRAFT_TOOLS,
+            max_turns: im.max_turns,
+            timeout: Duration::from_secs(im.timeout_s),
+        }) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("improve #{}: oprava selhala: {e:#}", imp.id);
+                break;
+            }
+        };
+        total_cost += outcome.cost_usd;
+        db::add_improvement_cost(conn, imp.id, outcome.cost_usd, outcome.tokens_in, outcome.tokens_out)?;
+        let _ = db::insert_cost(conn, util::now_ts(), "improve-repair", &im.model, outcome.tokens_in, outcome.tokens_out, outcome.cost_usd);
+        if worktree_is_clean(&wt)? {
+            break; // repair changed nothing → give up
+        }
+        commit_all(&wt, im, &format!("{}: oprava\n\nJarvis-Improvement: {}\n", util::truncate_chars(&imp.title, 60), imp.id))?;
+        let files = changed_files(&wt, &base)?;
+        head = git_head(&wt, "HEAD")?;
+        envelope = classify_envelope(&files);
+        diff_stat = git(&wt, &["diff", "--shortstat", &base, "HEAD"])?.trim().to_string();
+        db::update_improvement_draft(conn, imp.id, &branch, &base, &head, envelope, &diff_stat, STATUS_DRAFTING)?;
+        head_tests = count_test_attrs(&wt);
+        if !test_integrity_ok(base_tests, head_tests) {
+            let note = format!("test-integrity FAIL po opravě: {base_tests} → {head_tests}");
+            db::update_improvement_tests(conn, imp.id, Some(false), &note, STATUS_FAILED)?;
+            bail!("#{}: {note}", imp.id);
         }
     }
-
-    // exhausted attempts / budget / no-op repair → failed; keep branch for inspection
-    println!("── improve draft #{} ──", imp.id);
-    println!("větev:   {branch}");
-    if !head_short.is_empty() {
-        println!("commit:  {head_short}  (obálka {envelope}, {diff_stat})");
+    let reason = "brána červená (oprava nezabrala)";
+    if staged {
+        notify_staged_failed(paths, cfg, &imp, steps.len(), steps.len(), reason);
     }
-    println!("testy:   base {base_tests} → head {head_tests}; brána ✗ ČERVENÁ (vyčerpáno {max_attempts} pokusů)");
-    println!("náklad:  {total_cost:.4} USD");
-    println!("\n✗ nezvládnuto → failed. Log: jarvis improve show {}", imp.id);
-    bail!("brána červená po {max_attempts} pokusech (#{} → failed)", imp.id);
+    bail!("{reason} (#{} → failed)", imp.id);
 }
 
 /// `jarvis improve test <id>`: re-run the failable gate on an already-drafted
@@ -1326,6 +1503,26 @@ pub fn should_auto_merge(auto_merge_safe: bool, auto_merge_code: bool, envelope:
         ENV_SAFE => auto_merge_safe,
         _ => auto_merge_code,
     }
+}
+
+/// Parses `git diff --shortstat` ("N files changed, X insertions(+), Y
+/// deletions(-)") into (files, lines-changed). Missing parts count as 0.
+fn parse_diff_size(diff_stat: &str) -> (usize, usize) {
+    let num_before = |kw: &str| -> usize {
+        diff_stat
+            .split(kw)
+            .next()
+            .and_then(|pre| pre.split_whitespace().last())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0)
+    };
+    (num_before("file"), num_before("insertion") + num_before("deletion"))
+}
+
+/// Auto-merge size cap: a change within BOTH limits may auto-merge; anything
+/// bigger has too large a blast radius → human review even if otherwise eligible.
+fn is_small_enough(files: usize, lines: usize, max_files: usize, max_lines: usize) -> bool {
+    files <= max_files && lines <= max_lines
 }
 
 /// After a merge: auto-deploy when enabled, otherwise print the manual step.
@@ -1593,6 +1790,32 @@ mod tests {
         assert!(!should_auto_merge(true, false, ENV_FEATURE), "no code flag → human");
         // gate-critical: NEVER, even with both flags on
         assert!(!should_auto_merge(true, true, ENV_GATE_CRITICAL), "gate code never auto-merges");
+    }
+
+    #[test]
+    fn diff_size_parsing_and_cap() {
+        assert_eq!(parse_diff_size(" 3 files changed, 45 insertions(+), 12 deletions(-)"), (3, 57));
+        assert_eq!(parse_diff_size(" 1 file changed, 2 insertions(+)"), (1, 2));
+        assert_eq!(parse_diff_size(" 1 file changed, 5 deletions(-)"), (1, 5));
+        assert_eq!(parse_diff_size(""), (0, 0));
+        assert!(is_small_enough(3, 150, 3, 150), "on the limit = still small");
+        assert!(!is_small_enough(4, 10, 3, 150), "too many files → human");
+        assert!(!is_small_enough(1, 200, 3, 150), "too many lines → human");
+    }
+
+    #[test]
+    fn parse_plan_reads_steps_capped() {
+        let text = "Plán:\n```json\n{\"steps\":[{\"title\":\"A\",\"spec\":\"do A\"},{\"title\":\"B\",\"spec\":\"do B\"},{\"title\":\"C\",\"spec\":\"do C\"}]}\n```";
+        let steps = parse_plan(text, 2).unwrap();
+        assert_eq!(steps.len(), 2, "capped at max_steps");
+        assert_eq!(steps[0].title, "A");
+        assert_eq!(steps[0].spec, "do A");
+        // empty-spec steps dropped; garbage → None
+        assert!(parse_plan("{\"steps\":[{\"title\":\"x\",\"spec\":\"\"}]}", 5).is_none());
+        assert!(parse_plan("no json", 5).is_none());
+        // a titleless step falls back to a title derived from its spec
+        let one = parse_plan("{\"steps\":[{\"spec\":\"add mask helper\"}]}", 5).unwrap();
+        assert_eq!(one[0].title, "add mask helper");
     }
 
     #[test]

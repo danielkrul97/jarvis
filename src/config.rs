@@ -239,6 +239,15 @@ pub struct ImproveCfg {
     /// telegram.rs, Cargo.*, .cargo, .github) ALWAYS still need your review — a
     /// self-editing agent must never rewrite its own gates unreviewed.
     pub auto_merge_code: bool,
+    /// Auto-merge size cap: a GREEN change above this many changed files, or this
+    /// many changed lines (insertions+deletions), goes to human review even if it
+    /// is otherwise auto-merge-eligible. A big change has a big blast radius, so a
+    /// human always sees it regardless of the flags above.
+    pub auto_merge_max_files: usize,
+    pub auto_merge_max_lines: usize,
+    /// Staged (plan-then-build) mode: a task is first decomposed into at most this
+    /// many small, independently-built steps; 1 step = an ordinary single draft.
+    pub plan_max_steps: usize,
     /// Envelope C: after a merge, rebuild the binary, smoke-test it, hot-swap
     /// with a .prev rollback, and restart the daemons. false = merge only; you
     /// run `cargo install` yourself (today's behaviour).
@@ -278,6 +287,9 @@ impl Default for ImproveCfg {
             allow_self_source: false,
             auto_merge_safe: false,
             auto_merge_code: false,
+            auto_merge_max_files: 3,
+            auto_merge_max_lines: 150,
+            plan_max_steps: 6,
             deploy_enabled: false,
             model: String::new(),
             max_turns: 40,
@@ -1316,6 +1328,15 @@ impl Config {
         }
         if !im.repo_dir.is_empty() && !std::path::Path::new(&im.repo_dir).is_absolute() {
             bail!("improve.repo_dir musí být absolutní cesta, je '{}'", im.repo_dir);
+        }
+        if !(1..=500).contains(&im.auto_merge_max_files) {
+            bail!("improve.auto_merge_max_files musí být 1–500, je {}", im.auto_merge_max_files);
+        }
+        if !(1..=100_000).contains(&im.auto_merge_max_lines) {
+            bail!("improve.auto_merge_max_lines musí být 1–100000, je {}", im.auto_merge_max_lines);
+        }
+        if !(1..=20).contains(&im.plan_max_steps) {
+            bail!("improve.plan_max_steps musí být 1–20, je {}", im.plan_max_steps);
         }
         Blacklist::new(&self.capture)?;
         Ok(())
