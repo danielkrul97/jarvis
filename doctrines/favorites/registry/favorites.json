@@ -1,0 +1,63 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry-item.json",
+  "name": "doctrine-favorites",
+  "type": "registry:block",
+  "title": "Doctrine: Favorites (srdíčko / oblíbené)",
+  "description": "A favorite is a data signal, not a button. Ships the data layer (event-sourced, 0..1 value function), the UX layer (heart toggle + list), and the emitted-signal layer (Meta AddToWishlist CAPI + GA4 + internal Intel), consent-gated.",
+  "author": "Auction24",
+  "categories": ["doctrine", "marketplace", "growth"],
+  "registryDependencies": ["button"],
+  "dependencies": [],
+  "envVars": {
+    "META_PIXEL_ID": "",
+    "META_CAPI_TOKEN": "",
+    "GA4_MEASUREMENT_ID": "",
+    "GA4_API_SECRET": ""
+  },
+  "files": [
+    {
+      "path": "src/schema.sql",
+      "type": "registry:file",
+      "target": "~/db/doctrines/favorites.sql"
+    },
+    {
+      "path": "src/signal.ts",
+      "type": "registry:lib",
+      "target": "~/lib/doctrines/favorites/signal.ts"
+    },
+    {
+      "path": "src/component-contract.ts",
+      "type": "registry:component",
+      "target": "~/components/doctrines/favorites/contract.ts"
+    }
+  ],
+  "docs": "Run schema.sql against Postgres. Wire FavoriteButton.onToggle → persist a fav_event AND fan out via signal.ts. Provide META_*/GA4_* env vars for the marketing sinks; both are hard-gated on marketing consent. Reuse event.eventId as the Pixel eventID for Meta dedup.",
+  "meta": {
+    "doctrine": {
+      "version": "1.0.0",
+      "businessCapability": "wishlist-favorites",
+      "priority": 0.85,
+      "surfaces": ["card", "detail", "list", "compare"],
+      "dataLayer": {
+        "tables": ["fav_event", "fav_state", "fav_listing_rollup", "fav_subject_affinity", "fav_conversion"],
+        "sourceOfTruth": "fav_event",
+        "valueFunction": "fav_signal_value",
+        "valueRange": [0, 1]
+      },
+      "emittedSignals": [
+        { "sink": "meta-capi", "event": "AddToWishlist", "gatedOn": "marketing_consent" },
+        { "sink": "ga4", "event": "add_to_wishlist", "gatedOn": "marketing_consent" },
+        { "sink": "intel", "event": "favorite", "gatedOn": null }
+      ],
+      "requiresData": [
+        { "key": "listing.id", "required": true },
+        { "key": "listing.price", "required": false, "forSignal": "meta-capi.value" },
+        { "key": "listing.make", "required": false, "forSignal": "intel.affinity" },
+        { "key": "listing.body", "required": false, "forSignal": "intel.affinity" },
+        { "key": "subject.identity", "required": false, "forSignal": "meta-capi.user_data" }
+      ],
+      "requiresDoctrines": [],
+      "consent": { "marketing": "gates meta-capi + ga4; intel is first-party functional and ungated" }
+    }
+  }
+}
