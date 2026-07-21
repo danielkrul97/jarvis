@@ -35,13 +35,17 @@ const SRC_UTT: u8 = 1;
 /// reload only happens after a write, not on every query. Per-process; a
 /// concurrent write from another process shows up as a signature change (at
 /// most one extra reload).
+/// One source's embedding matrix: `(ref_id, vector)` rows, shared via `Arc`
+/// so a cache hit clones the handle, not the whole matrix.
+type EmbMatrix = Arc<Vec<(i64, Vec<f32>)>>;
+
 struct EmbCacheEntry {
     sig: (i64, i64),
-    items: Arc<Vec<(i64, Vec<f32>)>>,
+    items: EmbMatrix,
 }
 static EMB_CACHE: OnceLock<Mutex<HashMap<String, EmbCacheEntry>>> = OnceLock::new();
 
-fn embeddings_cached(conn: &Connection, source: &str) -> Result<Arc<Vec<(i64, Vec<f32>)>>> {
+fn embeddings_cached(conn: &Connection, source: &str) -> Result<EmbMatrix> {
     let sig = db::embeddings_signature(conn, source)?;
     let cache = EMB_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -670,6 +674,26 @@ fn fold_word(w: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeddings_cached_shares_arc_and_invalidates_on_write() {
+        // unique source name: EMB_CACHE is a process-global keyed by source
+        let src = "test_alias_src";
+        let conn = db::test_conn();
+        db::upsert_embedding(&conn, src, 1, "m", &[0.1, 0.2]).unwrap();
+
+        // two reads with no write between → same signature → shared Arc (cache hit)
+        let a = embeddings_cached(&conn, src).unwrap();
+        let b = embeddings_cached(&conn, src).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "cache hit má vrátit sdílený Arc, ne kopii");
+        assert_eq!(*a, vec![(1, vec![0.1, 0.2])]);
+
+        // a write bumps the signature → reload, so a fresh matrix (not the old Arc)
+        db::upsert_embedding(&conn, src, 2, "m", &[0.3, 0.4]).unwrap();
+        let c = embeddings_cached(&conn, src).unwrap();
+        assert!(!Arc::ptr_eq(&a, &c), "zápis má invalidovat cache");
+        assert_eq!(c.len(), 2);
+    }
 
     #[test]
     fn match_query_strips_wake_stopwords_and_folds() {
