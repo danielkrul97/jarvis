@@ -751,6 +751,14 @@ pub fn set_improvement_deployed(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Ids of improvements merged but not yet deployed — for the deferred deploy
+/// (one rebuild covers all of main once the user steps away).
+pub fn merged_improvement_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM improvements WHERE status='merged' ORDER BY id")?;
+    let ids = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
 /// Sum of `costs.usd` since `since` for components matching a LIKE pattern
 /// (e.g. 'improve%'). Input to the self-improvement daily budget guard.
 pub fn cost_since_like(conn: &Connection, like: &str, since: i64) -> Result<f64> {
@@ -924,6 +932,76 @@ pub fn utterance_count_since(conn: &Connection, since: i64) -> Result<i64> {
         |r| r.get(0),
     )
     .map_err(Into::into)
+}
+
+/// One transcript line for the live tail (`jarvis transcribe`): carries `id`
+/// (the tail cursor) and `source` on top of the text, unlike `UtteranceRow`.
+#[derive(Debug, Clone)]
+pub struct UtteranceLine {
+    pub id: i64,
+    pub ts_start: i64,
+    pub text: String,
+    pub lang: String,
+    pub conf: f64,
+    pub source: String,
+}
+
+fn map_utterance_line(r: &rusqlite::Row) -> rusqlite::Result<UtteranceLine> {
+    Ok(UtteranceLine {
+        id: r.get(0)?,
+        ts_start: r.get(1)?,
+        text: r.get(2)?,
+        lang: r.get(3)?,
+        conf: r.get(4)?,
+        source: r.get(5)?,
+    })
+}
+
+/// The last `limit` transcripts (oldest first) — the backlog shown before a
+/// live tail starts streaming. Optional `source` filters (e.g. "mic", "meet").
+pub fn recent_utterance_lines(
+    conn: &Connection,
+    source: Option<&str>,
+    limit: usize,
+) -> Result<Vec<UtteranceLine>> {
+    let mut sql = String::from("SELECT id, ts_start, text, lang, conf, source FROM utterances");
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(s) = source {
+        sql.push_str(" WHERE source = ?");
+        args.push(s.to_string().into());
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?");
+    args.push((limit as i64).into());
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt
+        .query_map(rusqlite::params_from_iter(args), map_utterance_line)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.reverse(); // DESC LIMIT gives the newest N; show them oldest → newest
+    Ok(rows)
+}
+
+/// Transcripts with `id > after_id` (oldest first) — the streaming step of the
+/// live tail. `after_id = 0` starts from the beginning; `limit` caps a burst.
+pub fn utterances_after(
+    conn: &Connection,
+    after_id: i64,
+    source: Option<&str>,
+    limit: usize,
+) -> Result<Vec<UtteranceLine>> {
+    let mut sql =
+        String::from("SELECT id, ts_start, text, lang, conf, source FROM utterances WHERE id > ?");
+    let mut args: Vec<rusqlite::types::Value> = vec![after_id.into()];
+    if let Some(s) = source {
+        sql.push_str(" AND source = ?");
+        args.push(s.to_string().into());
+    }
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    args.push((limit as i64).into());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), map_utterance_line)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 // ---------- semantic memory: facts (migration v8) ----------

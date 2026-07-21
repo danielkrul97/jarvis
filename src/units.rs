@@ -182,15 +182,17 @@ pub fn unit_files(
             ),
         ),
         (
-            // night cadence: codegen + cargo builds are slow and paid, so run
-            // while away; enabled only when [improve] enabled=true (ship dark).
+            // several times a day; the auto-deploy (restart) is deferred while
+            // the user is at the desk (improve::deploy_pending_when_away), so
+            // mid-day ticks merge but don't interrupt the voice assistant.
+            // Enabled only when [improve] enabled=true (ship dark).
             "jarvis-improve.timer",
             "[Unit]\n\
-             Description=Jarvis — sebe-vývoj (noční timer)\n\n\
+             Description=Jarvis — sebe-vývoj (několikrát denně)\n\n\
              [Timer]\n\
-             OnCalendar=*-*-* 03:17:00\n\
+             OnCalendar=*-*-* 00/4:15:00\n\
              Persistent=true\n\
-             RandomizedDelaySec=600\n\n\
+             RandomizedDelaySec=300\n\n\
              [Install]\n\
              WantedBy=timers.target\n"
                 .to_string(),

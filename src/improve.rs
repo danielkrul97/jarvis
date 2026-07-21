@@ -511,18 +511,58 @@ fn self_source_clippy(cfg: &Config, conn: &rusqlite::Connection) -> i64 {
 
 // ---------- autonomous tick (timer-driven) ----------
 
-/// One autonomous pass (from the `jarvis-improve` timer): if enabled and under
-/// the daily attempt/budget caps, draft the oldest queued task (self-sourcing
-/// first if the queue is empty and it's allowed), and on green, propose + email.
-/// At most one improvement per tick (stay calm). All errors are just logged —
-/// a timer must never abort. Blocks for the whole codegen; it runs in its own
-/// timer process, not the daemon loop.
+/// Is the user likely at the keyboard now? (fresh sample + low idle.) Used to
+/// DEFER the auto-deploy restart while Daniel is actively using Jarvis — the
+/// change still merges to git; the rebuild + restart waits until he steps away.
+fn user_present(cfg: &Config, conn: &rusqlite::Connection) -> bool {
+    let now = util::now_ts();
+    let row: Option<(i64, i64)> = conn
+        .query_row("SELECT ts, idle_ms FROM samples ORDER BY ts DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok();
+    match row {
+        Some((ts, idle_ms)) => {
+            let fresh = now - ts <= (cfg.capture.meta_interval_s as i64) * 3 + 5;
+            fresh && idle_ms < 300_000 // < 5 min idle = present at the desk
+        }
+        None => false, // no fresh sample (capture off / away) → safe to deploy
+    }
+}
+
+/// Deploys merged-but-not-deployed improvements, but only while the user is away
+/// — one rebuild puts all of main's new commits live. Called at the top of each
+/// tick, so daytime merges deploy as soon as Daniel steps away.
+fn deploy_pending_when_away(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) {
+    if !cfg.improve.deploy_enabled || user_present(cfg, conn) {
+        return;
+    }
+    let pending = match db::merged_improvement_ids(conn) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    info!("improve: nikdo u stolu → nasazuji {} smergnutých vylepšení", pending.len());
+    match deploy(paths, cfg, conn, pending[0], false) {
+        Ok(()) => {
+            for id in &pending[1..] {
+                let _ = db::set_improvement_deployed(conn, *id); // one rebuild = all of main live
+            }
+        }
+        Err(e) => warn!("improve: odložený deploy selhal: {e:#}"),
+    }
+}
+
+/// One autonomous pass (from the `jarvis-improve` timer): deploy any merged work
+/// if the user is away, then — under the daily caps — draft the next task
+/// (self-sourcing / ideating if the queue is empty), and on green auto-merge (+
+/// deploy when away) or e-mail for review. At most one improvement per tick. All
+/// errors are just logged — a timer must never abort.
 pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<()> {
     let im = &cfg.improve;
     if !im.enabled {
         info!("improve tick: [improve] enabled=false — nic nedělám");
         return Ok(());
     }
+    // first, land any merges that were deferred while Daniel was at the desk
+    deploy_pending_when_away(paths, cfg, conn);
     let day_start = util::day_bounds_local(util::today_local()).map(|(s, _)| s).unwrap_or(0);
     if db::improvement_attempts_since(conn, day_start).unwrap_or(0) >= im.daily_max as i64 {
         info!("improve tick: denní strop {} pokusů dosažen", im.daily_max);
@@ -560,10 +600,13 @@ pub fn tick(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection) -> Result<
                 match merge_improvement(paths, cfg, conn, &p) {
                     Ok(_) => {
                         if im.deploy_enabled {
-                            if let Err(e) = deploy(paths, cfg, conn, p.id, false) {
+                            if user_present(cfg, conn) {
+                                info!("improve tick: #{} smergnuto; u stolu → deploy odložen (nasadí se, až budeš pryč)", p.id);
+                            } else if let Err(e) = deploy(paths, cfg, conn, p.id, false) {
                                 warn!("improve tick: auto-deploy #{} selhal: {e:#}", p.id);
                             }
                         }
+
                         if let Ok(Some(done)) = db::improvement_by_id(conn, p.id) {
                             let acted = match done.status.as_str() {
                                 STATUS_DEPLOYED => "smergnuto + NASAZENO (rebuild + restart)",
@@ -1493,9 +1536,10 @@ fn merge_improvement(
         "diff #{} se změnil (otisk nesedí) — NEMERGUJI",
         imp.id
     );
-    ensure!(worktree_is_clean(&repo)?, "main má necommitnuté změny — ukliď před merge #{}", imp.id);
-    git(&repo, &["merge", "--ff-only", &imp.branch])
-        .with_context(|| format!("merge --ff-only {} selhal — #{} zůstává, řeš ručně", imp.branch, imp.id))?;
+    // fast-forward the `main` REF without checking it out — improve never touches
+    // the user's working tree or whatever branch they have checked out.
+    git(&repo, &["fetch", ".", &format!("{}:main", imp.branch)])
+        .with_context(|| format!("ff main←{} selhal (drift/ne-ff?) — #{} zůstává, řeš ručně", imp.branch, imp.id))?;
     db::set_improvement_merged(conn, imp.id)?;
     cleanup_worktree(&repo, &worktree_path(paths, imp.id));
     let _ = git(&repo, &["branch", "-d", &imp.branch]);
@@ -1610,7 +1654,6 @@ fn deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64, dry
     let repo = repo_root(cfg);
     let bin = install_path();
     let prev = bin.with_extension("prev");
-    let repo_s = repo.to_str().context("repo: cesta není UTF-8")?;
     let bin_s = bin.to_string_lossy().to_string();
 
     if dry_run {
@@ -1619,7 +1662,7 @@ fn deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64, dry
         println!("deploy_enabled: {}", im.deploy_enabled);
         println!("binárka:       {}", bin.display());
         println!("záloha:        {}", prev.display());
-        println!("1) build:      cargo install --path {repo_s} --force");
+        println!("1) build:      cargo install z čerstvého worktree na main (--force)");
         println!("2) smoke:      {bin_s} --version  +  improve tick --dry-run");
         println!("3) units+restart: {bin_s} install-units  +  systemctl --user restart jarvis-capture/listen");
         println!("rollback:      smoke/health FAIL → obnovit {} → restart", prev.display());
@@ -1637,9 +1680,16 @@ fn deploy(paths: &Paths, cfg: &Config, conn: &rusqlite::Connection, id: i64, dry
         info!("deploy #{id}: záloha do {}", prev.display());
     }
 
-    // 2. build + install release (overwrites the binary file)
-    info!("deploy #{id}: cargo install --path {repo_s} --force (release build — chvíli to trvá)");
-    let inst = run_capture("cargo", &["install", "--path", repo_s, "--force"], &repo, &[], Duration::from_secs(im.timeout_s.max(2400)))?;
+    // 2. build + install release from a FRESH detached worktree on main — never
+    // the user's current working tree / branch (which may hold unrelated WIP).
+    let build_wt = paths.data_dir.join("improve").join("deploy-main");
+    cleanup_worktree(&repo, &build_wt);
+    let build_wt_s = build_wt.to_str().context("build worktree: cesta není UTF-8")?;
+    git(&repo, &["worktree", "add", "--detach", build_wt_s, "main"])
+        .context("worktree na main pro build selhal")?;
+    info!("deploy #{id}: cargo install z {build_wt_s} (main, release — chvíli to trvá)");
+    let inst = run_capture("cargo", &["install", "--path", build_wt_s, "--force"], &build_wt, &[], Duration::from_secs(im.timeout_s.max(2400)))?;
+    cleanup_worktree(&repo, &build_wt);
     if inst.timed_out || inst.code != Some(0) {
         db::set_improvement_status(conn, id, STATUS_MERGED, "cargo install selhal (binárka nezměněna)")?;
         bail!("cargo install selhal — stará binárka zůstává:\n{}", util::truncate_chars(inst.stderr.trim(), 1200));
