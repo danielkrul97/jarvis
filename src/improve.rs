@@ -39,8 +39,11 @@ use tracing::{info, warn};
 /// Tools handed to the codegen agent inside the worktree: it may read, edit,
 /// write, and build/test — but NOT run git (Jarvis owns every git operation and
 /// the gates) and NOT `cargo add`/`install`/`publish` (deps are gate-critical).
-const DRAFT_TOOLS: &str = "Read,Edit,Write,Bash(cargo build:*),Bash(cargo test:*),\
-    Bash(cargo check:*),Bash(cargo fmt:*),Bash(cargo clippy:*)";
+// Only fast `cargo check`/`fmt` — NOT the full `cargo test` (a slow full-crate +
+// CUDA compile on this codebase; the agent ran it repeatedly and hit max_turns).
+// The authoritative full test suite is Jarvis's gate; a red gate feeds the
+// failure back for repair.
+const DRAFT_TOOLS: &str = "Read,Edit,Write,Bash(cargo check:*),Bash(cargo fmt:*)";
 
 // improvement sources (= improvements.source column)
 pub const SRC_DIRECTED: &str = "directed"; // "Jarvisi, teach yourself X"
@@ -884,8 +887,11 @@ dependencies. Do NOT add crates (`cargo add` is unavailable).\n\
 - Be cautious around gate/safety files (config.rs defaults, runbook.rs, improve.rs, \
 units.rs, main.rs, telegram.rs). Touch them only if the task truly requires it, and \
 say so in your summary if you do.\n\
-- You have Read/Edit/Write and cargo (build/test/check/fmt/clippy). You do NOT have \
-git — do not attempt commits; committing is handled for you.\n\n\
+- You have Read/Edit/Write and `cargo check` (fast compile check) + `cargo fmt`. You do \
+NOT have the full test suite (it is slow) — write tests but do NOT run `cargo test`; the \
+full suite is run for you afterward and any failure comes back for you to fix. No git.\n\
+- Work EFFICIENTLY — limited turn budget. Read ONLY the file(s) you will change (grep for \
+what you need; don't read the whole codebase). Make all edits, then `cargo check` once.\n\n\
 WHEN DONE, output ONE JSON object and nothing after it:\n\
 {{\"summary\": \"one line: what you changed\", \"files_changed\": [\"src/...\"], \
 \"tests_added\": <int>, \"touched_gate_files\": <bool>}}\n\n\
@@ -917,8 +923,9 @@ Fix it with the SMALLEST change; keep what already works, don't restart from scr
 ORIGINAL TASK: {spec}\n\n\
 CARGO TEST OUTPUT (tail):\n{}\n\n\
 Same rules: NEVER weaken, delete, or #[ignore] tests to go green (the test count must \
-not drop); reuse existing helpers; do not add crates; you have Read/Edit/Write and \
-cargo but NOT git. Make cargo test pass, then output ONE JSON object:\n\
+not drop); reuse existing helpers; do not add crates; you have Read/Edit/Write and fast \
+`cargo check` (NOT the full suite) but NOT git. Fix the SPECIFIC failure above \
+efficiently; the full suite is re-run for you. Then output ONE JSON object:\n\
 {{\"summary\": \"what you fixed\", \"files_changed\": [\"src/...\"], \"tests_added\": <int>, \"touched_gate_files\": <bool>}}",
         util::truncate_chars(gate_output.trim(), 3000)
     )
@@ -1029,8 +1036,10 @@ STEP {i}/{total} — {}:\n{}\n\n\
 House rules: English comments (brief — WHY, not what); match the surrounding style; add \
 unit tests for what you add; NEVER weaken, delete, or #[ignore] existing tests (the test \
 count must not drop); reuse existing helpers; do not add crates unless essential; you \
-have Read/Edit/Write and cargo (build/test) but NOT git. Leave the code COMPILING at the \
-end of this step. When done, output ONE JSON object: {{\"summary\": \"what this step did\"}}",
+have Read/Edit/Write and fast `cargo check` (NOT the slow full test suite — it is run for \
+you afterward) but NOT git. Read only what you need; work within your turn budget. Leave \
+the code COMPILING at the end of this step. When done, output ONE JSON object: \
+{{\"summary\": \"what this step did\"}}",
         step.title, step.spec
     )
 }
